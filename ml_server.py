@@ -48,19 +48,34 @@ le = LabelEncoder()
 # ─────────────────────────────────────────────
 
 def get_mes_data():
-    """Fetch ALL mes data via PHP API for training"""
     try:
-        response = requests.get(PHP_API_URL, params={
+        url = PHP_API_URL
+        params = {
             "action": "get_mes",
             "key":    API_KEY
-        }, headers=HEADERS, timeout=30)
+        }
+        logging.info(f"Calling: {url} with params: {params}")
+        
+        response = requests.get(
+            url, 
+            params=params,
+            headers=HEADERS, 
+            timeout=30,
+            allow_redirects=True
+        )
+        
+        logging.info(f"Status: {response.status_code}")
+        logging.info(f"Headers: {dict(response.headers)}")
+        logging.info(f"Response: {response.text[:1000]}")
+        
         data = response.json()
         if isinstance(data, list):
             return pd.DataFrame(data)
-        logging.error(f"get_mes_data() unexpected response: {data}")
+        logging.error(f"Unexpected: {data}")
         return pd.DataFrame()
     except Exception as e:
         logging.error(f"get_mes_data() failed: {e}")
+        logging.error(f"Response text: {response.text[:500] if 'response' in locals() else 'No response'}")
         return pd.DataFrame()
 
 
