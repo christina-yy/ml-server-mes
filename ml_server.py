@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import re
 import numpy as np
 import pandas as pd
-import requests  # ← NEW: replaces sqlalchemy
+import requests
 import os
 import logging
 from datetime import datetime
@@ -14,13 +14,24 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ─────────────────────────────────────────────
-# PHP API Config — reads from Render env vars
+# PHP API Config
 # ─────────────────────────────────────────────
 PHP_API_URL = os.environ.get(
     "PHP_API_URL",
     "https://mesystem.infinityfreeapp.com/api.php"
 )
 API_KEY = os.environ.get("API_KEY", "mes_secret_key_2026")
+
+# ─────────────────────────────────────────────
+# Browser Headers — tricks InfinityFree into
+# allowing the request (it blocks plain servers)
+# ─────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://mesystem.infinityfreeapp.com/"
+}
 
 FEATURES = [
     'defects', 'scrapRate', 'downTimeHours', 'energyConsumption',
@@ -42,7 +53,7 @@ def get_mes_data():
         response = requests.get(PHP_API_URL, params={
             "action": "get_mes",
             "key":    API_KEY
-        }, timeout=30)
+        }, headers=HEADERS, timeout=30)
         data = response.json()
         if isinstance(data, list):
             return pd.DataFrame(data)
@@ -60,7 +71,7 @@ def get_machine_data(machine_id):
             "action":    "get_machine",
             "machineID": machine_id,
             "key":       API_KEY
-        }, timeout=15)
+        }, headers=HEADERS, timeout=15)
         data = response.json()
         if isinstance(data, list):
             return pd.DataFrame(data)
@@ -97,7 +108,6 @@ def auto_label(row):
 def train_model():
     global rf_model, le
     try:
-        # NEW: fetch from PHP API instead of MySQL directly
         df = get_mes_data()
 
         if df.empty:
@@ -105,7 +115,9 @@ def train_model():
             return
 
         df['date']   = pd.to_datetime(df['date'])
-        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
+        df[FEATURES] = df[FEATURES].apply(
+            pd.to_numeric, errors='coerce'
+        ).fillna(0)
         df['label']  = df.apply(auto_label, axis=1)
 
         X = df[FEATURES].values
@@ -115,14 +127,16 @@ def train_model():
             X, y, test_size=0.2, random_state=42
         )
 
-        # n_estimators=100 saves RAM on Render free tier
         rf_model = RandomForestClassifier(
             n_estimators=100,
             class_weight="balanced",
             random_state=42
         )
         rf_model.fit(X_train, y_train)
-        logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
+        logging.info(
+            f"Model trained on {len(df)} rows. "
+            f"Classes: {list(le.classes_)}"
+        )
 
     except Exception as e:
         logging.error(f"train_model() failed: {e}")
@@ -132,7 +146,7 @@ train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent Keywords Map (unchanged)
+# Intent Keywords Map
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -163,14 +177,25 @@ INTENT_KEYWORDS = {
 }
 
 INTENT_FIELD_MAP = {
-    "units": "unitsProduced", "defects": "defects", "downtime": "downTimeHours",
-    "maintenance": "maintenanceHours", "scrap": "scrapRate", "rework": "reworkHours",
-    "quality": "qualityChecksFailed", "energy": "energyConsumption",
-    "temperature": "averageTemperature", "humidity": "averageHumidityPercent",
-    "operators": "operatorCount", "volume": "productionVolumeCubicMeters",
-    "shift": "shift", "machine_id": "machineID", "production_time": "ProductionTime",
-    "product_type": "productType", "production_id": "productionID",
-    "material_cost": "materialCostPerUnit", "labour_cost": "labourCostPerUnit",
+    "units":           "unitsProduced",
+    "defects":         "defects",
+    "downtime":        "downTimeHours",
+    "maintenance":     "maintenanceHours",
+    "scrap":           "scrapRate",
+    "rework":          "reworkHours",
+    "quality":         "qualityChecksFailed",
+    "energy":          "energyConsumption",
+    "temperature":     "averageTemperature",
+    "humidity":        "averageHumidityPercent",
+    "operators":       "operatorCount",
+    "volume":          "productionVolumeCubicMeters",
+    "shift":           "shift",
+    "machine_id":      "machineID",
+    "production_time": "ProductionTime",
+    "product_type":    "productType",
+    "production_id":   "productionID",
+    "material_cost":   "materialCostPerUnit",
+    "labour_cost":     "labourCostPerUnit",
 }
 
 
@@ -179,15 +204,22 @@ def detect_intent(text):
     for priority in ["predict", "compare", "top", "summary"]:
         if any(k in text for k in INTENT_KEYWORDS[priority]):
             return priority
-    scores = {i: sum(1 for kw in kws if kw in text) for i, kws in INTENT_KEYWORDS.items()}
+    scores = {
+        i: sum(1 for kw in kws if kw in text)
+        for i, kws in INTENT_KEYWORDS.items()
+    }
     scores = {i: s for i, s in scores.items() if s > 0}
     return max(scores, key=scores.get) if scores else "unknown"
 
 
 def extract_machine_id(text):
     text = text.lower()
-    for pat in [r'machine\s*no\.?\s*(\d+)', r'machine\s*number\s*(\d+)',
-                r'machine\s*(\d+)', r'\bm\s*(\d+)\b']:
+    for pat in [
+        r'machine\s*no\.?\s*(\d+)',
+        r'machine\s*number\s*(\d+)',
+        r'machine\s*(\d+)',
+        r'\bm\s*(\d+)\b'
+    ]:
         m = re.search(pat, text)
         if m:
             return int(m.group(1))
@@ -220,7 +252,7 @@ def health():
 
 
 # ─────────────────────────────────────────────
-# Parse Route (unchanged)
+# Parse Route
 # ─────────────────────────────────────────────
 
 @app.route("/parse", methods=["POST"])
@@ -254,15 +286,20 @@ def predict():
         machine_id = request.json.get("machineID")
 
         if rf_model is None:
-            return jsonify({"error": "Model not trained yet. Call /retrain first."})
+            return jsonify({
+                "error": "Model not trained yet. Call /retrain first."
+            })
 
-        # NEW: fetch from PHP API instead of MySQL directly
         df = get_machine_data(machine_id)
 
         if df.empty:
-            return jsonify({"error": f"No data found for machine {machine_id}"})
+            return jsonify({
+                "error": f"No data found for machine {machine_id}"
+            })
 
-        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
+        df[FEATURES] = df[FEATURES].apply(
+            pd.to_numeric, errors='coerce'
+        ).fillna(0)
         row   = df[FEATURES].mean().values.reshape(1, -1)
         pred  = rf_model.predict(row)[0]
         prob  = rf_model.predict_proba(row)[0]
