@@ -1,8 +1,9 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import re
 import numpy as np
 import pandas as pd
-import requests
+import sqlalchemy
 import os
 import logging
 from datetime import datetime
@@ -11,27 +12,23 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 
 app = Flask(__name__)
+CORS(app)
 logging.basicConfig(level=logging.INFO)
 
 # ─────────────────────────────────────────────
-# PHP API Config
+# Database — reads DB_URL from Render env var
 # ─────────────────────────────────────────────
-PHP_API_URL = os.environ.get(
-    "PHP_API_URL",
-    "https://mesystem.infinityfreeapp.com/api.php"
+DB_URL = os.environ.get(
+    "DB_URL",
+    "mysql+pymysql://root:@127.0.0.1:3306/manufacturing_db"
 )
-API_KEY = os.environ.get("API_KEY", "mes_secret_key_2026")
 
-# ─────────────────────────────────────────────
-# Browser Headers — tricks InfinityFree into
-# allowing the request (it blocks plain servers)
-# ─────────────────────────────────────────────
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://mesystem.infinityfreeapp.com/"
-}
+engine = sqlalchemy.create_engine(
+    DB_URL,
+    pool_pre_ping=True,
+    pool_recycle=280,
+    connect_args={"connect_timeout": 10}
+)
 
 FEATURES = [
     'defects', 'scrapRate', 'downTimeHours', 'energyConsumption',
@@ -44,72 +41,18 @@ le = LabelEncoder()
 
 
 # ─────────────────────────────────────────────
-# PHP API Helper Functions
-# ─────────────────────────────────────────────
-
-def get_mes_data():
-    try:
-        url = PHP_API_URL
-        params = {
-            "action": "get_mes",
-            "key":    API_KEY
-        }
-        logging.info(f"Calling: {url} with params: {params}")
-        
-        response = requests.get(
-            url, 
-            params=params,
-            headers=HEADERS, 
-            timeout=30,
-            allow_redirects=True
-        )
-        
-        logging.info(f"Status: {response.status_code}")
-        logging.info(f"Headers: {dict(response.headers)}")
-        logging.info(f"Response: {response.text[:1000]}")
-        
-        data = response.json()
-        if isinstance(data, list):
-            return pd.DataFrame(data)
-        logging.error(f"Unexpected: {data}")
-        return pd.DataFrame()
-    except Exception as e:
-        logging.error(f"get_mes_data() failed: {e}")
-        logging.error(f"Response text: {response.text[:500] if 'response' in locals() else 'No response'}")
-        return pd.DataFrame()
-
-
-def get_machine_data(machine_id):
-    """Fetch last 7 days data for one machine via PHP API"""
-    try:
-        response = requests.get(PHP_API_URL, params={
-            "action":    "get_machine",
-            "machineID": machine_id,
-            "key":       API_KEY
-        }, headers=HEADERS, timeout=15)
-        data = response.json()
-        if isinstance(data, list):
-            return pd.DataFrame(data)
-        logging.error(f"get_machine_data() unexpected response: {data}")
-        return pd.DataFrame()
-    except Exception as e:
-        logging.error(f"get_machine_data() failed: {e}")
-        return pd.DataFrame()
-
-
-# ─────────────────────────────────────────────
 # Auto Label
 # ─────────────────────────────────────────────
 
 def auto_label(row):
     score = 0
-    if row['defects'] > 15:        score += 2
-    elif row['defects'] > 7:       score += 1
-    if row['scrapRate'] > 0.07:    score += 2
-    elif row['scrapRate'] > 0.035: score += 1
-    if row['downTimeHours'] > 2.5: score += 2
-    elif row['downTimeHours'] > 1: score += 1
-    if row['reworkHours'] > 1.5:   score += 1
+    if row['defects'] > 15:            score += 2
+    elif row['defects'] > 7:           score += 1
+    if row['scrapRate'] > 0.07:        score += 2
+    elif row['scrapRate'] > 0.035:     score += 1
+    if row['downTimeHours'] > 2.5:     score += 2
+    elif row['downTimeHours'] > 1:     score += 1
+    if row['reworkHours'] > 1.5:       score += 1
     if row['qualityChecksFailed'] > 2: score += 1
     if score >= 4:   return "Critical"
     elif score >= 1: return "At Risk"
@@ -117,22 +60,24 @@ def auto_label(row):
 
 
 # ─────────────────────────────────────────────
-# Train Model
+# Train Model (from DB — used on startup)
 # ─────────────────────────────────────────────
 
 def train_model():
     global rf_model, le
     try:
-        df = get_mes_data()
-
+        today = datetime.today().strftime("%Y-%m-%d")
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                sqlalchemy.text("SELECT * FROM mes WHERE date <= :d ORDER BY date"),
+                conn, params={"d": today}
+            )
         if df.empty:
             logging.warning("No training data found — model not trained.")
             return
 
         df['date']   = pd.to_datetime(df['date'])
-        df[FEATURES] = df[FEATURES].apply(
-            pd.to_numeric, errors='coerce'
-        ).fillna(0)
+        df[FEATURES] = df[FEATURES].fillna(0)
         df['label']  = df.apply(auto_label, axis=1)
 
         X = df[FEATURES].values
@@ -141,17 +86,11 @@ def train_model():
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
-
         rf_model = RandomForestClassifier(
-            n_estimators=100,
-            class_weight="balanced",
-            random_state=42
+            n_estimators=300, class_weight="balanced", random_state=42
         )
         rf_model.fit(X_train, y_train)
-        logging.info(
-            f"Model trained on {len(df)} rows. "
-            f"Classes: {list(le.classes_)}"
-        )
+        logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
 
     except Exception as e:
         logging.error(f"train_model() failed: {e}")
@@ -192,25 +131,14 @@ INTENT_KEYWORDS = {
 }
 
 INTENT_FIELD_MAP = {
-    "units":           "unitsProduced",
-    "defects":         "defects",
-    "downtime":        "downTimeHours",
-    "maintenance":     "maintenanceHours",
-    "scrap":           "scrapRate",
-    "rework":          "reworkHours",
-    "quality":         "qualityChecksFailed",
-    "energy":          "energyConsumption",
-    "temperature":     "averageTemperature",
-    "humidity":        "averageHumidityPercent",
-    "operators":       "operatorCount",
-    "volume":          "productionVolumeCubicMeters",
-    "shift":           "shift",
-    "machine_id":      "machineID",
-    "production_time": "ProductionTime",
-    "product_type":    "productType",
-    "production_id":   "productionID",
-    "material_cost":   "materialCostPerUnit",
-    "labour_cost":     "labourCostPerUnit",
+    "units": "unitsProduced", "defects": "defects", "downtime": "downTimeHours",
+    "maintenance": "maintenanceHours", "scrap": "scrapRate", "rework": "reworkHours",
+    "quality": "qualityChecksFailed", "energy": "energyConsumption",
+    "temperature": "averageTemperature", "humidity": "averageHumidityPercent",
+    "operators": "operatorCount", "volume": "productionVolumeCubicMeters",
+    "shift": "shift", "machine_id": "machineID", "production_time": "ProductionTime",
+    "product_type": "productType", "production_id": "productionID",
+    "material_cost": "materialCostPerUnit", "labour_cost": "labourCostPerUnit",
 }
 
 
@@ -219,22 +147,15 @@ def detect_intent(text):
     for priority in ["predict", "compare", "top", "summary"]:
         if any(k in text for k in INTENT_KEYWORDS[priority]):
             return priority
-    scores = {
-        i: sum(1 for kw in kws if kw in text)
-        for i, kws in INTENT_KEYWORDS.items()
-    }
+    scores = {i: sum(1 for kw in kws if kw in text) for i, kws in INTENT_KEYWORDS.items()}
     scores = {i: s for i, s in scores.items() if s > 0}
     return max(scores, key=scores.get) if scores else "unknown"
 
 
 def extract_machine_id(text):
     text = text.lower()
-    for pat in [
-        r'machine\s*no\.?\s*(\d+)',
-        r'machine\s*number\s*(\d+)',
-        r'machine\s*(\d+)',
-        r'\bm\s*(\d+)\b'
-    ]:
+    for pat in [r'machine\s*no\.?\s*(\d+)', r'machine\s*number\s*(\d+)',
+                r'machine\s*(\d+)', r'\bm\s*(\d+)\b']:
         m = re.search(pat, text)
         if m:
             return int(m.group(1))
@@ -278,7 +199,6 @@ def parse():
         machine_id = extract_machine_id(text)
         m1, m2     = extract_compare_machines(text) if intent == "compare" else (None, None)
         top_n      = extract_top_n(text) if intent == "top" else None
-
         return jsonify({
             "intent":           intent,
             "machine_id":       machine_id,
@@ -292,29 +212,30 @@ def parse():
 
 
 # ─────────────────────────────────────────────
-# Predict Route
+# Predict Route (original — uses DB directly)
 # ─────────────────────────────────────────────
 
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
         machine_id = request.json.get("machineID")
-
         if rf_model is None:
-            return jsonify({
-                "error": "Model not trained yet. Call /retrain first."
-            })
+            return jsonify({"error": "Model not trained yet. Call /retrain first."})
 
-        df = get_machine_data(machine_id)
-
+        today = datetime.today().strftime("%Y-%m-%d")
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                sqlalchemy.text("""
+                    SELECT * FROM mes
+                    WHERE machineID = :mid AND date <= :d
+                    ORDER BY date DESC LIMIT 7
+                """),
+                conn, params={"mid": machine_id, "d": today}
+            )
         if df.empty:
-            return jsonify({
-                "error": f"No data found for machine {machine_id}"
-            })
+            return jsonify({"error": f"No data found for machine {machine_id}"})
 
-        df[FEATURES] = df[FEATURES].apply(
-            pd.to_numeric, errors='coerce'
-        ).fillna(0)
+        df[FEATURES] = df[FEATURES].fillna(0)
         row   = df[FEATURES].mean().values.reshape(1, -1)
         pred  = rf_model.predict(row)[0]
         prob  = rf_model.predict_proba(row)[0]
@@ -332,7 +253,7 @@ def predict():
 
 
 # ─────────────────────────────────────────────
-# Retrain Route
+# Retrain Route (original — uses DB directly)
 # ─────────────────────────────────────────────
 
 @app.route("/retrain", methods=["POST"])
@@ -345,6 +266,84 @@ def retrain():
         })
     except Exception as e:
         logging.error(f"/retrain error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────
+# Predict Raw — browser sends records directly
+# No DB call needed, works with InfinityFree
+# ─────────────────────────────────────────────
+
+@app.route("/predict-raw", methods=["POST"])
+def predict_raw():
+    try:
+        if rf_model is None:
+            return jsonify({"error": "Model not trained yet. Ask me to retrain first."}), 400
+
+        records = request.json.get("records", [])
+        if not records:
+            return jsonify({"error": "No records provided"}), 400
+
+        df = pd.DataFrame(records)
+        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
+
+        row   = df[FEATURES].mean().values.reshape(1, -1)
+        pred  = rf_model.predict(row)[0]
+        prob  = rf_model.predict_proba(row)[0]
+        label = le.inverse_transform([pred])[0]
+
+        return jsonify({
+            "status":     label,
+            "confidence": round(float(max(prob)) * 100, 1),
+            "rows_used":  len(df)
+        })
+
+    except Exception as e:
+        logging.error(f"/predict-raw error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────
+# Retrain Raw — browser sends all records
+# No DB call needed, works with InfinityFree
+# ─────────────────────────────────────────────
+
+@app.route("/retrain-raw", methods=["POST"])
+def retrain_raw():
+    global rf_model, le
+    try:
+        records = request.json.get("records", [])
+        if not records:
+            return jsonify({"error": "No records provided"}), 400
+
+        df = pd.DataFrame(records)
+        df['date']   = pd.to_datetime(df['date'], errors='coerce')
+        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
+        df['label']  = df.apply(auto_label, axis=1)
+
+        X = df[FEATURES].values
+        y = le.fit_transform(df['label'])
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+        rf_model = RandomForestClassifier(
+            n_estimators=300, class_weight="balanced", random_state=42
+        )
+        rf_model.fit(X_train, y_train)
+
+        label_counts = df['label'].value_counts().to_dict()
+
+        return jsonify({
+            "message":      "Model retrained successfully",
+            "rows_used":    len(df),
+            "classes":      list(le.classes_),
+            "label_counts": label_counts,
+            "model_ready":  True
+        })
+
+    except Exception as e:
+        logging.error(f"/retrain-raw error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
