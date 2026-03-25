@@ -241,21 +241,13 @@ def _train_core(df: pd.DataFrame):
         "Random Forest": RandomForestClassifier(
             n_estimators=300,
             class_weight="balanced",
-            min_samples_leaf=5,
+            min_samples_leaf=3,
             random_state=42
-        ),
-        "XGBoost": XGBClassifier(
-            n_estimators=300,
-            use_label_encoder=False,
-            eval_metric="mlogloss",
-            scale_pos_weight=len(y_train) / (n_classes * max(np.bincount(y_train))),
-            random_state=42,
-            verbosity=0
         ),
         "Decision Tree": DecisionTreeClassifier(
             class_weight="balanced",
             max_depth=8,
-            min_samples_leaf=5,
+            min_samples_leaf=3,
             random_state=42
         )
     }
