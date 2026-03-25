@@ -6,17 +6,11 @@ import pandas as pd
 import sqlalchemy
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.tree import DecisionTreeClassifier
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import cross_val_score
-from sklearn.metrics import (
-    classification_report, confusion_matrix,
-    f1_score, accuracy_score
-)
-from imblearn.over_sampling import SMOTE
-from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 
 app = Flask(__name__)
 CORS(app)
@@ -43,43 +37,52 @@ FEATURES = [
     'averageTemperature', 'averageHumidityPercent'
 ]
 
-# ─────────────────────────────────────────────
-# Global state
-# ─────────────────────────────────────────────
-rf_model   = None   # active model used for predictions (best from comparison)
-le         = LabelEncoder()
-_feature_medians  = {}
-_eval_metrics     = {}   # stores last evaluation results — exposed via /metrics
-_model_comparison = []   # stores per-model comparison results
+rf_model = None
+le = LabelEncoder()
+
+# Median values from training data — used to impute nulls at prediction time
+# Populated during train_model(); avoids filling unknown rows with 0
+_feature_medians = {}
 
 
 # ─────────────────────────────────────────────
-# Auto Label  (data-driven thresholds v2)
+# Auto Label  (v2 — data-driven thresholds)
+#
+# Changes from v1:
+#   • ScrapRate thresholds lowered to 0.045 / 0.035
+#     (old 0.07 was above the dataset max of 0.05 — never fired)
+#   • Defects Critical threshold lowered to >9 (p90) from >15
+#   • Downtime At Risk raised to >1.5h (p50) from >1h
+#   • qualityChecksFailed threshold lowered to >1 from >2
+#     (max value in dataset is 2, so >2 never fired)
+#   • Added maintenanceHours >4.0 as a contributing signal
+#   • Critical score threshold raised to >=5 so the label is
+#     genuinely harder to reach and less noisy
 # ─────────────────────────────────────────────
 
 def auto_label(row):
     score = 0
 
-    # Defects  (p75=7, p90=9)
-    if row['defects'] > 9:             score += 2
-    elif row['defects'] > 7:           score += 1
+    # Defects  (p75 = 7, p90 = 9)
+    if row['defects'] > 9:           score += 2
+    elif row['defects'] > 7:         score += 1
 
-    # Scrap rate  (dataset max=0.05; p75=0.04, p90=0.046)
-    if row['scrapRate'] > 0.045:       score += 2
-    elif row['scrapRate'] > 0.035:     score += 1
+    # Scrap rate  (dataset max = 0.05; p75 = 0.04, p90 = 0.046)
+    if row['scrapRate'] > 0.045:     score += 2
+    elif row['scrapRate'] > 0.035:   score += 1
 
-    # Downtime  (p50=1.57h, p75=2.3h, p90=2.69h)
-    if row['downTimeHours'] > 2.5:     score += 2
-    elif row['downTimeHours'] > 1.5:   score += 1
+    # Downtime  (p50 = 1.57h, p75 = 2.3h, p90 = 2.69h)
+    if row['downTimeHours'] > 2.5:   score += 2
+    elif row['downTimeHours'] > 1.5: score += 1
 
-    # Rework hours  (p75=1.45h, p90=1.8h)
-    if row['reworkHours'] > 1.8:       score += 1
+    # Rework hours  (p75 = 1.45h, p90 = 1.8h)
+    if row['reworkHours'] > 1.8:     score += 1
 
-    # Quality checks failed  (max=2, so >1 means value is 2)
+    # Quality checks failed  (max = 2, so >1 means value is 2)
     if row['qualityChecksFailed'] > 1: score += 1
 
-    # Maintenance — high hours signal underlying issues
-    if row['maintenanceHours'] > 4.0:  score += 1
+    # Maintenance hours — high maintenance indicates underlying issues
+    if row['maintenanceHours'] > 4.0: score += 1
 
     if score >= 5:   return "Critical"
     elif score >= 2: return "At Risk"
@@ -88,6 +91,7 @@ def auto_label(row):
 
 # ─────────────────────────────────────────────
 # Impute nulls with training-set medians
+# (filling with 0 incorrectly makes missing rows look Healthy)
 # ─────────────────────────────────────────────
 
 def impute(df):
@@ -102,234 +106,11 @@ def impute(df):
 
 
 # ─────────────────────────────────────────────
-# Trend Detection
-#
-# Given a DataFrame of recent records for one machine (sorted oldest→newest),
-# compute a degradation score that captures whether key metrics are
-# worsening over time — even if the current snapshot still looks "At Risk".
-#
-# Method:
-#   For each of the four most predictive features, fit a linear slope
-#   over the window. Normalise each slope by the feature's training-set
-#   std so slopes are comparable across different units/scales.
-#   A positive slope means the metric is getting worse (more defects,
-#   more downtime, etc.).  Sum the normalised slopes into a single
-#   degradation score and bucket it into three levels.
-#
-# Returns a dict:
-#   degradation_score  – float (higher = deteriorating faster)
-#   trend_level        – "Stable" | "Deteriorating" | "Rapidly Deteriorating"
-#   feature_trends     – per-feature slope direction
-# ─────────────────────────────────────────────
-
-TREND_FEATURES = ['defects', 'scrapRate', 'downTimeHours', 'reworkHours']
-
-# Approximate stds from training data — used for normalisation.
-# Updated by _train_core() each time a model is trained.
-_feature_stds = {
-    'defects': 3.2, 'scrapRate': 0.011,
-    'downTimeHours': 0.88, 'reworkHours': 0.58
-}
-
-
-def compute_trend(df: pd.DataFrame) -> dict:
-    """df must be sorted oldest→newest and contain TREND_FEATURES columns."""
-    if len(df) < 3:
-        return {
-            "degradation_score": 0.0,
-            "trend_level": "Stable",
-            "feature_trends": {},
-            "note": "Fewer than 3 data points — trend unreliable"
-        }
-
-    n = len(df)
-    x = np.arange(n, dtype=float)
-    degradation_score = 0.0
-    feature_trends = {}
-
-    for feat in TREND_FEATURES:
-        if feat not in df.columns:
-            continue
-        y = df[feat].values.astype(float)
-        if np.isnan(y).all():
-            continue
-        # Fill any remaining NaNs with column median so polyfit doesn't fail
-        y = np.where(np.isnan(y), np.nanmedian(y), y)
-        slope = np.polyfit(x, y, 1)[0]
-        std   = _feature_stds.get(feat, 1.0)
-        norm  = slope / std if std > 0 else 0.0
-        degradation_score += max(norm, 0)          # only count worsening
-        feature_trends[feat] = "worsening" if slope > 0 else "improving"
-
-    if degradation_score >= 0.5:
-        level = "Rapidly Deteriorating"
-    elif degradation_score >= 0.15:
-        level = "Deteriorating"
-    else:
-        level = "Stable"
-
-    return {
-        "degradation_score": round(degradation_score, 3),
-        "trend_level":       level,
-        "feature_trends":    feature_trends
-    }
-
-
-# ─────────────────────────────────────────────
-# Model Comparison + SMOTE  (core training)
-#
-# Trains three classifiers on the same SMOTE-balanced training set:
-#   1. Random Forest   (n=300, balanced weights, min_samples_leaf=5)
-#   2. XGBoost         (scale_pos_weight handles imbalance)
-#   3. Decision Tree   (baseline — simple, explainable)
-#
-# Uses a time-aware 80/20 train/test split.
-# SMOTE is applied ONLY to the training fold — never to the test set.
-# The best model (highest macro F1 on test) becomes the active predictor.
-#
-# Why macro F1 and not accuracy?
-#   Accuracy is dominated by the majority class. Macro F1 weights all
-#   three classes equally, so it penalises models that miss Critical.
-# ─────────────────────────────────────────────
-
-def _train_core(df: pd.DataFrame):
-    global rf_model, le, _feature_medians, _eval_metrics, _model_comparison, _feature_stds
-
-    df = df.copy()
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df = df.sort_values('date').reset_index(drop=True)
-
-    # Store medians and stds BEFORE imputing
-    for col in FEATURES:
-        if col in df.columns:
-            _feature_medians[col] = float(df[col].median())
-
-    for feat in TREND_FEATURES:
-        if feat in df.columns:
-            _feature_stds[feat] = float(df[feat].std()) or 1.0
-
-    df = impute(df)
-    df['label'] = df.apply(auto_label, axis=1)
-
-    label_counts = df['label'].value_counts().to_dict()
-    logging.info(f"Label distribution: {label_counts}")
-
-    X = df[FEATURES].values
-    y = le.fit_transform(df['label'])   # At Risk=0, Critical=1, Healthy=2
-
-    # Time-aware split: last 20% of records for testing
-    split_idx  = int(len(df) * 0.8)
-    X_train_raw, X_test = X[:split_idx],  X[split_idx:]
-    y_train_raw, y_test = y[:split_idx],  y[split_idx:]
-
-    # ── SMOTE: oversample minority classes in training set only ──────────
-    # k_neighbors must be < smallest class count in training set
-    min_class_count = min(np.bincount(y_train_raw))
-    k = min(5, min_class_count - 1) if min_class_count > 1 else 1
-    try:
-        sm = SMOTE(random_state=42, k_neighbors=k)
-        X_train, y_train = sm.fit_resample(X_train_raw, y_train_raw)
-        smote_counts = dict(zip(*np.unique(y_train, return_counts=True)))
-        logging.info(f"After SMOTE — train class counts: {smote_counts}")
-    except Exception as e:
-        logging.warning(f"SMOTE failed ({e}), using raw training set.")
-        X_train, y_train = X_train_raw, y_train_raw
-
-    # ── Define candidate models ──────────────────────────────────────────
-    n_classes = len(le.classes_)
-    candidates = {
-        "Random Forest": RandomForestClassifier(
-            n_estimators=300,
-            class_weight="balanced",
-            min_samples_leaf=3,
-            random_state=42
-        ),
-        "Decision Tree": DecisionTreeClassifier(
-            class_weight="balanced",
-            max_depth=8,
-            min_samples_leaf=3,
-            random_state=42
-        )
-    }
-
-    # ── Train, evaluate, compare ─────────────────────────────────────────
-    results    = []
-    best_model = None
-    best_f1    = -1.0
-
-    for name, model in candidates.items():
-        model.fit(X_train, y_train)
-        y_pred   = model.predict(X_test)
-        acc      = accuracy_score(y_test, y_pred)
-        macro_f1 = f1_score(y_test, y_pred, average='macro', zero_division=0)
-        per_class_f1 = f1_score(
-            y_test, y_pred, average=None,
-            labels=range(len(le.classes_)), zero_division=0
-        )
-        cm = confusion_matrix(y_test, y_pred).tolist()
-
-        class_f1_dict = {
-            cls: round(float(f), 3)
-            for cls, f in zip(le.classes_, per_class_f1)
-        }
-
-        result = {
-            "model":         name,
-            "accuracy":      round(acc, 4),
-            "macro_f1":      round(macro_f1, 4),
-            "per_class_f1":  class_f1_dict,
-            "confusion_matrix": cm
-        }
-        results.append(result)
-
-        report = classification_report(
-            y_test, y_pred,
-            target_names=le.classes_,
-            zero_division=0
-        )
-        logging.info(f"\n── {name} ──\n{report}")
-
-        if macro_f1 > best_f1:
-            best_f1    = macro_f1
-            best_model = model
-            best_name  = name
-
-    _model_comparison = results
-    rf_model = best_model   # active model = winner of comparison
-
-    # Store full eval metrics for /metrics endpoint
-    y_pred_best = rf_model.predict(X_test)
-    _eval_metrics = {
-        "best_model":        best_name,
-        "accuracy":          round(float(accuracy_score(y_test, y_pred_best)), 4),
-        "macro_f1":          round(float(f1_score(y_test, y_pred_best, average='macro', zero_division=0)), 4),
-        "rows_trained":      int(len(df)),
-        "smote_applied":     True,
-        "label_counts":      label_counts,
-        "classes":           list(le.classes_),
-        "confusion_matrix":  confusion_matrix(y_test, y_pred_best).tolist(),
-        "classification_report": classification_report(
-            y_test, y_pred_best,
-            target_names=le.classes_,
-            zero_division=0,
-            output_dict=True
-        ),
-        "model_comparison":  results
-    }
-
-    logging.info(
-        f"Best model: {best_name} (macro F1={best_f1:.3f}). "
-        f"Trained on {len(df)} rows (SMOTE applied to train fold)."
-    )
-    return label_counts
-
-
-# ─────────────────────────────────────────────
-# Train on startup from DB
+# Train Model
 # ─────────────────────────────────────────────
 
 def train_model():
-    global rf_model, le
+    global rf_model, le, _feature_medians
     try:
         today = datetime.today().strftime("%Y-%m-%d")
         with engine.connect() as conn:
@@ -340,16 +121,67 @@ def train_model():
         if df.empty:
             logging.warning("No training data found — model not trained.")
             return
+
         _train_core(df)
+
     except Exception as e:
         logging.error(f"train_model() failed: {e}")
+
+
+def _train_core(df):
+    """Shared training logic used by both /retrain and /retrain-raw."""
+    global rf_model, le, _feature_medians
+
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+    # Store medians BEFORE imputing so they reflect real data distribution
+    for col in FEATURES:
+        if col in df.columns:
+            _feature_medians[col] = df[col].median()
+
+    df = impute(df)
+    df['label'] = df.apply(auto_label, axis=1)
+
+    label_counts = df['label'].value_counts().to_dict()
+    logging.info(f"Label distribution: {label_counts}")
+
+    X = df[FEATURES].values
+    y = le.fit_transform(df['label'])
+
+    # Time-aware train/test split — sort by date so test set is always
+    # the most recent 20% of records. A random split leaks future data
+    # into training, which inflates accuracy on sequential data.
+    split_idx = int(len(df) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
+    rf_model = RandomForestClassifier(
+        n_estimators=300,
+        class_weight="balanced",
+        min_samples_leaf=5,   # prevents overfitting on the tiny Critical class
+        random_state=42
+    )
+    rf_model.fit(X_train, y_train)
+
+    # Log a proper per-class evaluation report
+    if len(X_test) > 0:
+        y_pred = rf_model.predict(X_test)
+        report = classification_report(
+            y_test, y_pred,
+            target_names=le.classes_,
+            zero_division=0
+        )
+        logging.info(f"Classification report (time-aware test split):\n{report}")
+
+    logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
+    return label_counts
 
 
 train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent detection helpers  (unchanged)
+# Intent Keywords Map  (unchanged)
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -377,7 +209,6 @@ INTENT_KEYWORDS = {
     "production_id":   ["production id", "production ids", "record id", "record ids", "list records", "all records"],
     "material_cost":   ["material cost", "material cost per unit", "material price"],
     "labour_cost":     ["labour cost", "labor cost", "labour cost per unit", "labor cost per unit", "labour price", "worker cost"],
-    "trend":           ["trend", "degradation", "deteriorating", "getting worse", "worsening"],
 }
 
 INTENT_FIELD_MAP = {
@@ -394,7 +225,7 @@ INTENT_FIELD_MAP = {
 
 def detect_intent(text):
     text = text.lower()
-    for priority in ["predict", "compare", "top", "summary", "trend"]:
+    for priority in ["predict", "compare", "top", "summary"]:
         if any(k in text for k in INTENT_KEYWORDS[priority]):
             return priority
     scores = {i: sum(1 for kw in kws if kw in text) for i, kws in INTENT_KEYWORDS.items()}
@@ -433,7 +264,6 @@ def health():
     return jsonify({
         "status":      "ok",
         "model_ready": rf_model is not None,
-        "best_model":  _eval_metrics.get("best_model"),
         "timestamp":   datetime.now().isoformat()
     })
 
@@ -464,140 +294,52 @@ def parse():
 
 # ─────────────────────────────────────────────
 # Predict Route  (DB-based)
-#
-# Returns:
-#   status, confidence, probabilities  — snapshot prediction
-#   trend                              — degradation trend over last 14 days
 # ─────────────────────────────────────────────
 
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
         machine_id = request.json.get("machineID")
-        window     = int(request.json.get("window", 7))  # days to average
-
         if rf_model is None:
             return jsonify({"error": "Model not trained yet. Call /retrain first."})
 
         today = datetime.today().strftime("%Y-%m-%d")
         with engine.connect() as conn:
-            # Fetch more rows than needed so trend has enough points
             df = pd.read_sql(
                 sqlalchemy.text("""
                     SELECT * FROM mes
                     WHERE machineID = :mid AND date <= :d
-                    ORDER BY date DESC LIMIT 14
+                    ORDER BY date DESC LIMIT 7
                 """),
                 conn, params={"mid": machine_id, "d": today}
             )
-
         if df.empty:
             return jsonify({"error": f"No data found for machine {machine_id}"})
 
-        df = df.sort_values('date').reset_index(drop=True)
         df = impute(df)
 
-        # Snapshot: median of most recent `window` records
-        snap_df = df.tail(window)
-        row     = snap_df[FEATURES].median().values.reshape(1, -1)
-        pred    = rf_model.predict(row)[0]
-        proba   = rf_model.predict_proba(row)[0]
-        label   = le.inverse_transform([pred])[0]
+        # Use median instead of mean — more robust to outlier days
+        row = df[FEATURES].median().values.reshape(1, -1)
+        pred  = rf_model.predict(row)[0]
+        proba = rf_model.predict_proba(row)[0]
+        label = le.inverse_transform([pred])[0]
 
+        # Return all class probabilities so the frontend can show a breakdown
         class_probs = {
             cls: round(float(p) * 100, 1)
             for cls, p in zip(le.classes_, proba)
         }
 
-        # Trend: use all available rows (up to 14)
-        trend = compute_trend(df)
-
         return jsonify({
             "machineID":   machine_id,
             "status":      label,
             "confidence":  round(float(max(proba)) * 100, 1),
-            "probabilities": class_probs,
-            "trend":       trend,
-            "rows_used":   len(snap_df)
+            "probabilities": class_probs
         })
 
     except Exception as e:
         logging.error(f"/predict error: {e}")
         return jsonify({"error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────
-# Trend Route  (DB-based, dedicated endpoint)
-# ─────────────────────────────────────────────
-
-@app.route("/trend", methods=["POST"])
-def trend_route():
-    try:
-        machine_id = request.json.get("machineID")
-        days       = int(request.json.get("days", 14))
-
-        today    = datetime.today().strftime("%Y-%m-%d")
-        cutoff   = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
-
-        with engine.connect() as conn:
-            df = pd.read_sql(
-                sqlalchemy.text("""
-                    SELECT * FROM mes
-                    WHERE machineID = :mid AND date BETWEEN :start AND :end
-                    ORDER BY date ASC
-                """),
-                conn, params={"mid": machine_id, "start": cutoff, "end": today}
-            )
-
-        if df.empty:
-            return jsonify({"error": f"No data found for machine {machine_id} in last {days} days"})
-
-        df = impute(df)
-        trend = compute_trend(df)
-
-        return jsonify({
-            "machineID": machine_id,
-            "days":      days,
-            "rows":      len(df),
-            **trend
-        })
-
-    except Exception as e:
-        logging.error(f"/trend error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────
-# Metrics Route  (evaluation results)
-#
-# Returns:
-#   - Best model name and why it won
-#   - Accuracy, macro F1
-#   - Full confusion matrix
-#   - Per-class precision/recall/F1
-#   - Model comparison table (all three candidates)
-#   - Label distribution from training data
-# ─────────────────────────────────────────────
-
-@app.route("/metrics", methods=["GET"])
-def metrics():
-    if not _eval_metrics:
-        return jsonify({"error": "No metrics available. Train the model first."}), 400
-    return jsonify(_eval_metrics)
-
-
-# ─────────────────────────────────────────────
-# Model Comparison Route
-# ─────────────────────────────────────────────
-
-@app.route("/model-comparison", methods=["GET"])
-def model_comparison():
-    if not _model_comparison:
-        return jsonify({"error": "No comparison data. Train the model first."}), 400
-    return jsonify({
-        "best_model": _eval_metrics.get("best_model"),
-        "comparison": _model_comparison
-    })
 
 
 # ─────────────────────────────────────────────
@@ -610,8 +352,6 @@ def retrain():
         train_model()
         return jsonify({
             "message":     "Model retrained successfully",
-            "best_model":  _eval_metrics.get("best_model"),
-            "macro_f1":    _eval_metrics.get("macro_f1"),
             "model_ready": rf_model is not None
         })
     except Exception as e:
@@ -637,11 +377,7 @@ def predict_raw():
         df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
         df = impute(df)
 
-        # Sort by date if present so trend is meaningful
-        if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            df = df.sort_values('date').reset_index(drop=True)
-
+        # Use median of the window — more robust to outlier days than mean
         row   = df[FEATURES].median().values.reshape(1, -1)
         pred  = rf_model.predict(row)[0]
         proba = rf_model.predict_proba(row)[0]
@@ -652,13 +388,10 @@ def predict_raw():
             for cls, p in zip(le.classes_, proba)
         }
 
-        trend = compute_trend(df)
-
         return jsonify({
             "status":        label,
             "confidence":    round(float(max(proba)) * 100, 1),
             "probabilities": class_probs,
-            "trend":         trend,
             "rows_used":     len(df)
         })
 
@@ -686,14 +419,11 @@ def retrain_raw():
         label_counts = _train_core(df)
 
         return jsonify({
-            "message":          "Model retrained successfully",
-            "rows_used":        len(df),
-            "best_model":       _eval_metrics.get("best_model"),
-            "macro_f1":         _eval_metrics.get("macro_f1"),
-            "classes":          list(le.classes_),
-            "label_counts":     label_counts,
-            "model_comparison": _model_comparison,
-            "model_ready":      True
+            "message":      "Model retrained successfully",
+            "rows_used":    len(df),
+            "classes":      list(le.classes_),
+            "label_counts": label_counts,
+            "model_ready":  True
         })
 
     except Exception as e:
