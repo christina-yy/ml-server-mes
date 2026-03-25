@@ -6,3 +6,5 @@ numpy
 pymysql
 sqlalchemy
 gunicorn
+imbalanced-learn
+xgboost
