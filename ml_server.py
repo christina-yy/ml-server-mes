@@ -41,23 +41,15 @@ rf_model = None
 le = LabelEncoder()
 
 # Median values from training data — used to impute nulls at prediction time
-# Populated during train_model(); avoids filling unknown rows with 0
 _feature_medians = {}
 
 
 # ─────────────────────────────────────────────
-# Auto Label  (v2 — data-driven thresholds)
+# Auto Label  (v3 — improved Critical recall)
 #
-# Changes from v1:
-#   • ScrapRate thresholds lowered to 0.045 / 0.035
-#     (old 0.07 was above the dataset max of 0.05 — never fired)
-#   • Defects Critical threshold lowered to >9 (p90) from >15
-#   • Downtime At Risk raised to >1.5h (p50) from >1h
-#   • qualityChecksFailed threshold lowered to >1 from >2
-#     (max value in dataset is 2, so >2 never fired)
-#   • Added maintenanceHours >4.0 as a contributing signal
-#   • Critical score threshold raised to >=5 so the label is
-#     genuinely harder to reach and less noisy
+# Changes from v2:
+#   • Critical score threshold lowered to >=4 (was >=5)
+#     → improves recall on the Critical class (was 0.45)
 # ─────────────────────────────────────────────
 
 def auto_label(row):
@@ -84,14 +76,14 @@ def auto_label(row):
     # Maintenance hours — high maintenance indicates underlying issues
     if row['maintenanceHours'] > 4.0: score += 1
 
-    if score >= 5:   return "Critical"
+    # FIX 1: Lowered Critical threshold from 5 → 4 to improve recall
+    if score >= 4:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
 
 
 # ─────────────────────────────────────────────
 # Impute nulls with training-set medians
-# (filling with 0 incorrectly makes missing rows look Healthy)
 # ─────────────────────────────────────────────
 
 def impute(df):
@@ -149,21 +141,22 @@ def _train_core(df):
     y = le.fit_transform(df['label'])
 
     # Time-aware train/test split — sort by date so test set is always
-    # the most recent 20% of records. A random split leaks future data
-    # into training, which inflates accuracy on sequential data.
+    # the most recent 20% of records.
     split_idx = int(len(df) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
+    # FIX 4: min_samples_leaf lowered 5 → 3 (less overfit, better Critical fit)
+    # FIX 5: class_weight gives Critical 3× weight to improve recall
     rf_model = RandomForestClassifier(
         n_estimators=300,
-        class_weight="balanced",
-        min_samples_leaf=5,   # prevents overfitting on the tiny Critical class
+        class_weight={"At Risk": 1, "Healthy": 1, "Critical": 3},
+        min_samples_leaf=3,
         random_state=42
     )
     rf_model.fit(X_train, y_train)
 
-    # Log a proper per-class evaluation report
+    # Log per-class evaluation report
     if len(X_test) > 0:
         y_pred = rf_model.predict(X_test)
         report = classification_report(
@@ -181,7 +174,7 @@ train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent Keywords Map  (unchanged)
+# Intent Keywords Map
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -294,6 +287,8 @@ def parse():
 
 # ─────────────────────────────────────────────
 # Predict Route  (DB-based)
+# FIX 2: Expanded window from LIMIT 7 → LIMIT 30
+# FIX 3: Added input logging to diagnose 100% confidence
 # ─────────────────────────────────────────────
 
 @app.route("/predict", methods=["POST"])
@@ -309,7 +304,7 @@ def predict():
                 sqlalchemy.text("""
                     SELECT * FROM mes
                     WHERE machineID = :mid AND date <= :d
-                    ORDER BY date DESC LIMIT 7
+                    ORDER BY date DESC LIMIT 30
                 """),
                 conn, params={"mid": machine_id, "d": today}
             )
@@ -318,22 +313,26 @@ def predict():
 
         df = impute(df)
 
-        # Use median instead of mean — more robust to outlier days
         row = df[FEATURES].median().values.reshape(1, -1)
+
+        # FIX 3: Log what the model actually receives — helps diagnose 100% confidence
+        logging.info(f"[/predict] Machine {machine_id} — input row: {row.tolist()}")
+
         pred  = rf_model.predict(row)[0]
         proba = rf_model.predict_proba(row)[0]
         label = le.inverse_transform([pred])[0]
 
-        # Return all class probabilities so the frontend can show a breakdown
         class_probs = {
             cls: round(float(p) * 100, 1)
             for cls, p in zip(le.classes_, proba)
         }
 
+        logging.info(f"[/predict] Machine {machine_id} — result: {label}, probs: {class_probs}")
+
         return jsonify({
-            "machineID":   machine_id,
-            "status":      label,
-            "confidence":  round(float(max(proba)) * 100, 1),
+            "machineID":     machine_id,
+            "status":        label,
+            "confidence":    round(float(max(proba)) * 100, 1),
             "probabilities": class_probs
         })
 
@@ -361,6 +360,7 @@ def retrain():
 
 # ─────────────────────────────────────────────
 # Predict Raw  (browser sends records directly)
+# FIX 3: Added input logging to diagnose 100% confidence
 # ─────────────────────────────────────────────
 
 @app.route("/predict-raw", methods=["POST"])
@@ -377,8 +377,11 @@ def predict_raw():
         df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
         df = impute(df)
 
-        # Use median of the window — more robust to outlier days than mean
         row   = df[FEATURES].median().values.reshape(1, -1)
+
+        # FIX 3: Log what the model actually receives — helps diagnose 100% confidence
+        logging.info(f"[/predict-raw] rows_used={len(df)} — input row: {row.tolist()}")
+
         pred  = rf_model.predict(row)[0]
         proba = rf_model.predict_proba(row)[0]
         label = le.inverse_transform([pred])[0]
@@ -387,6 +390,8 @@ def predict_raw():
             cls: round(float(p) * 100, 1)
             for cls, p in zip(le.classes_, proba)
         }
+
+        logging.info(f"[/predict-raw] result: {label}, probs: {class_probs}")
 
         return jsonify({
             "status":        label,
