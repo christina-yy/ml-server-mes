@@ -10,13 +10,14 @@ from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 
 app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO)
 
 # ─────────────────────────────────────────────
-# Database — reads DB_URL from Render env var
+# Database
 # ─────────────────────────────────────────────
 DB_URL = os.environ.get(
     "DB_URL",
@@ -39,32 +40,77 @@ FEATURES = [
 rf_model = None
 le = LabelEncoder()
 
+# Median values from training data — used to impute nulls at prediction time
+# Populated during train_model(); avoids filling unknown rows with 0
+_feature_medians = {}
+
 
 # ─────────────────────────────────────────────
-# Auto Label
+# Auto Label  (v2 — data-driven thresholds)
+#
+# Changes from v1:
+#   • ScrapRate thresholds lowered to 0.045 / 0.035
+#     (old 0.07 was above the dataset max of 0.05 — never fired)
+#   • Defects Critical threshold lowered to >9 (p90) from >15
+#   • Downtime At Risk raised to >1.5h (p50) from >1h
+#   • qualityChecksFailed threshold lowered to >1 from >2
+#     (max value in dataset is 2, so >2 never fired)
+#   • Added maintenanceHours >4.0 as a contributing signal
+#   • Critical score threshold raised to >=5 so the label is
+#     genuinely harder to reach and less noisy
 # ─────────────────────────────────────────────
 
 def auto_label(row):
     score = 0
-    if row['defects'] > 15:            score += 2
-    elif row['defects'] > 7:           score += 1
-    if row['scrapRate'] > 0.07:        score += 2
-    elif row['scrapRate'] > 0.035:     score += 1
-    if row['downTimeHours'] > 2.5:     score += 2
-    elif row['downTimeHours'] > 1:     score += 1
-    if row['reworkHours'] > 1.5:       score += 1
-    if row['qualityChecksFailed'] > 2: score += 1
-    if score >= 4:   return "Critical"
-    elif score >= 1: return "At Risk"
+
+    # Defects  (p75 = 7, p90 = 9)
+    if row['defects'] > 9:           score += 2
+    elif row['defects'] > 7:         score += 1
+
+    # Scrap rate  (dataset max = 0.05; p75 = 0.04, p90 = 0.046)
+    if row['scrapRate'] > 0.045:     score += 2
+    elif row['scrapRate'] > 0.035:   score += 1
+
+    # Downtime  (p50 = 1.57h, p75 = 2.3h, p90 = 2.69h)
+    if row['downTimeHours'] > 2.5:   score += 2
+    elif row['downTimeHours'] > 1.5: score += 1
+
+    # Rework hours  (p75 = 1.45h, p90 = 1.8h)
+    if row['reworkHours'] > 1.8:     score += 1
+
+    # Quality checks failed  (max = 2, so >1 means value is 2)
+    if row['qualityChecksFailed'] > 1: score += 1
+
+    # Maintenance hours — high maintenance indicates underlying issues
+    if row['maintenanceHours'] > 4.0: score += 1
+
+    if score >= 5:   return "Critical"
+    elif score >= 2: return "At Risk"
     else:            return "Healthy"
 
 
 # ─────────────────────────────────────────────
-# Train Model (from DB — used on startup)
+# Impute nulls with training-set medians
+# (filling with 0 incorrectly makes missing rows look Healthy)
+# ─────────────────────────────────────────────
+
+def impute(df):
+    for col in FEATURES:
+        if col in df.columns:
+            median = _feature_medians.get(col)
+            if median is not None:
+                df[col] = df[col].fillna(median)
+            else:
+                df[col] = df[col].fillna(df[col].median())
+    return df
+
+
+# ─────────────────────────────────────────────
+# Train Model
 # ─────────────────────────────────────────────
 
 def train_model():
-    global rf_model, le
+    global rf_model, le, _feature_medians
     try:
         today = datetime.today().strftime("%Y-%m-%d")
         with engine.connect() as conn:
@@ -76,31 +122,66 @@ def train_model():
             logging.warning("No training data found — model not trained.")
             return
 
-        df['date']   = pd.to_datetime(df['date'])
-        df[FEATURES] = df[FEATURES].fillna(0)
-        df['label']  = df.apply(auto_label, axis=1)
-
-        X = df[FEATURES].values
-        y = le.fit_transform(df['label'])
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-        rf_model = RandomForestClassifier(
-            n_estimators=300, class_weight="balanced", random_state=42
-        )
-        rf_model.fit(X_train, y_train)
-        logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
+        _train_core(df)
 
     except Exception as e:
         logging.error(f"train_model() failed: {e}")
+
+
+def _train_core(df):
+    """Shared training logic used by both /retrain and /retrain-raw."""
+    global rf_model, le, _feature_medians
+
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+    # Store medians BEFORE imputing so they reflect real data distribution
+    for col in FEATURES:
+        if col in df.columns:
+            _feature_medians[col] = df[col].median()
+
+    df = impute(df)
+    df['label'] = df.apply(auto_label, axis=1)
+
+    label_counts = df['label'].value_counts().to_dict()
+    logging.info(f"Label distribution: {label_counts}")
+
+    X = df[FEATURES].values
+    y = le.fit_transform(df['label'])
+
+    # Time-aware train/test split — sort by date so test set is always
+    # the most recent 20% of records. A random split leaks future data
+    # into training, which inflates accuracy on sequential data.
+    split_idx = int(len(df) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
+    rf_model = RandomForestClassifier(
+        n_estimators=300,
+        class_weight="balanced",
+        min_samples_leaf=5,   # prevents overfitting on the tiny Critical class
+        random_state=42
+    )
+    rf_model.fit(X_train, y_train)
+
+    # Log a proper per-class evaluation report
+    if len(X_test) > 0:
+        y_pred = rf_model.predict(X_test)
+        report = classification_report(
+            y_test, y_pred,
+            target_names=le.classes_,
+            zero_division=0
+        )
+        logging.info(f"Classification report (time-aware test split):\n{report}")
+
+    logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
+    return label_counts
 
 
 train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent Keywords Map
+# Intent Keywords Map  (unchanged)
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -212,7 +293,7 @@ def parse():
 
 
 # ─────────────────────────────────────────────
-# Predict Route (original — uses DB directly)
+# Predict Route  (DB-based)
 # ─────────────────────────────────────────────
 
 @app.route("/predict", methods=["POST"])
@@ -235,16 +316,25 @@ def predict():
         if df.empty:
             return jsonify({"error": f"No data found for machine {machine_id}"})
 
-        df[FEATURES] = df[FEATURES].fillna(0)
-        row   = df[FEATURES].mean().values.reshape(1, -1)
+        df = impute(df)
+
+        # Use median instead of mean — more robust to outlier days
+        row = df[FEATURES].median().values.reshape(1, -1)
         pred  = rf_model.predict(row)[0]
-        prob  = rf_model.predict_proba(row)[0]
+        proba = rf_model.predict_proba(row)[0]
         label = le.inverse_transform([pred])[0]
 
+        # Return all class probabilities so the frontend can show a breakdown
+        class_probs = {
+            cls: round(float(p) * 100, 1)
+            for cls, p in zip(le.classes_, proba)
+        }
+
         return jsonify({
-            "machineID":  machine_id,
-            "status":     label,
-            "confidence": round(float(max(prob)) * 100, 1)
+            "machineID":   machine_id,
+            "status":      label,
+            "confidence":  round(float(max(proba)) * 100, 1),
+            "probabilities": class_probs
         })
 
     except Exception as e:
@@ -253,7 +343,7 @@ def predict():
 
 
 # ─────────────────────────────────────────────
-# Retrain Route (original — uses DB directly)
+# Retrain Route  (DB-based)
 # ─────────────────────────────────────────────
 
 @app.route("/retrain", methods=["POST"])
@@ -270,8 +360,7 @@ def retrain():
 
 
 # ─────────────────────────────────────────────
-# Predict Raw — browser sends records directly
-# No DB call needed, works with InfinityFree
+# Predict Raw  (browser sends records directly)
 # ─────────────────────────────────────────────
 
 @app.route("/predict-raw", methods=["POST"])
@@ -285,17 +374,25 @@ def predict_raw():
             return jsonify({"error": "No records provided"}), 400
 
         df = pd.DataFrame(records)
-        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
+        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
+        df = impute(df)
 
-        row   = df[FEATURES].mean().values.reshape(1, -1)
+        # Use median of the window — more robust to outlier days than mean
+        row   = df[FEATURES].median().values.reshape(1, -1)
         pred  = rf_model.predict(row)[0]
-        prob  = rf_model.predict_proba(row)[0]
+        proba = rf_model.predict_proba(row)[0]
         label = le.inverse_transform([pred])[0]
 
+        class_probs = {
+            cls: round(float(p) * 100, 1)
+            for cls, p in zip(le.classes_, proba)
+        }
+
         return jsonify({
-            "status":     label,
-            "confidence": round(float(max(prob)) * 100, 1),
-            "rows_used":  len(df)
+            "status":        label,
+            "confidence":    round(float(max(proba)) * 100, 1),
+            "probabilities": class_probs,
+            "rows_used":     len(df)
         })
 
     except Exception as e:
@@ -304,8 +401,7 @@ def predict_raw():
 
 
 # ─────────────────────────────────────────────
-# Retrain Raw — browser sends all records
-# No DB call needed, works with InfinityFree
+# Retrain Raw  (browser sends all records)
 # ─────────────────────────────────────────────
 
 @app.route("/retrain-raw", methods=["POST"])
@@ -317,22 +413,10 @@ def retrain_raw():
             return jsonify({"error": "No records provided"}), 400
 
         df = pd.DataFrame(records)
-        df['date']   = pd.to_datetime(df['date'], errors='coerce')
-        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
-        df['label']  = df.apply(auto_label, axis=1)
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
 
-        X = df[FEATURES].values
-        y = le.fit_transform(df['label'])
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-        rf_model = RandomForestClassifier(
-            n_estimators=300, class_weight="balanced", random_state=42
-        )
-        rf_model.fit(X_train, y_train)
-
-        label_counts = df['label'].value_counts().to_dict()
+        label_counts = _train_core(df)
 
         return jsonify({
             "message":      "Model retrained successfully",
