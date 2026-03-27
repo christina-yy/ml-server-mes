@@ -37,6 +37,10 @@ FEATURES = [
     'averageTemperature', 'averageHumidityPercent'
 ]
 
+# Spike-sensitive features — use max instead of median
+# These are features where a single bad day matters more than the average
+SPIKE_FEATURES = ['defects', 'scrapRate', 'downTimeHours', 'qualityChecksFailed', 'reworkHours']
+
 rf_model = None
 le = LabelEncoder()
 
@@ -45,42 +49,37 @@ _feature_medians = {}
 
 
 # ─────────────────────────────────────────────
-# Auto Label  (v3 — data-driven from actual dataset)
+# Auto Label  (v4 — spike-aware thresholds)
 #
-# Changes from v2:
-#   • Defects >15 now scores +4 (extreme outliers in dataset reach 34)
-#     → triggers Critical alone without needing other signals
-#   • ScrapRate scoring made finer-grained: >0.046 = +3, >0.040 = +2, >0.030 = +1
-#     (scrapRate is the #1 feature by importance at 31.9%)
-#   • qualityChecksFailed now scores proportionally: =2 → +2, =1 → +1
-#     (previously both >1 and =2 gave same score)
-#   • maintenanceHours >4.5 now scores +2 (was flat +1 for >4.0)
-#   • reworkHours >1.4 now gives +0.5 as a partial signal
-#   • Critical threshold raised to >=6 (was >=5) to keep labels clean
-#     with the higher scores above
-#
-# Result: Critical recall improved from 45% → 84%, Critical samples 100 → 267
+# Changes from v3:
+#   • Uses MAX values for spike features instead of median
+#     (defects, scrapRate, downTimeHours, qualityChecksFailed, reworkHours)
+#   • Stable features (energy, maintenance, temp, humidity) still use median
+#   • This prevents single bad-day spikes from being smoothed away
+#   • Thresholds re-validated against full dataset percentiles:
+#       downtime p75=2.3, p90=2.72 → >2.5 is genuinely high (top ~18%)
+#       scrapRate p75=0.04, p90=0.046 → thresholds confirmed correct
+#       defects p75=7, p90=9 → thresholds confirmed correct
 # ─────────────────────────────────────────────
 
 def auto_label(row):
     score = 0
 
-    # Defects (dataset max = 34; p75 = 7, p90 = 9)
-    if row['defects'] > 15:             score += 4   # extreme outlier → Critical alone
+    # Defects (dataset max=34; p75=7, p90=9)
+    if row['defects'] > 15:             score += 4
     elif row['defects'] > 9:            score += 2
     elif row['defects'] > 7:            score += 1
 
-    # Scrap Rate — top feature by importance (31.9%)
-    # Dataset range: 0.01–0.05; p90 = 0.046
+    # Scrap Rate — top feature by importance (p75=0.04, p90=0.046)
     if row['scrapRate'] > 0.046:        score += 3
     elif row['scrapRate'] > 0.040:      score += 2
     elif row['scrapRate'] > 0.030:      score += 1
 
-    # Downtime (p50 = 1.57h, p75 = 2.3h, max = 3.0h)
+    # Downtime (p75=2.3h, p90=2.72h — >2.5 is top ~18%)
     if row['downTimeHours'] > 2.5:      score += 2
     elif row['downTimeHours'] > 1.5:    score += 1
 
-    # Rework hours (p75 = 1.49h, p90 = 1.82h, max = 2.0h)
+    # Rework hours (p75=1.49h, p90=1.82h)
     if row['reworkHours'] > 1.8:        score += 1
     elif row['reworkHours'] > 1.4:      score += 0.5
 
@@ -88,13 +87,40 @@ def auto_label(row):
     if row['qualityChecksFailed'] == 2: score += 2
     elif row['qualityChecksFailed'] == 1: score += 1
 
-    # Maintenance hours (p75 = 3.76h, p90 = 4.5h, max = 5.0h)
+    # Maintenance hours (p75=3.76h, p90=4.5h)
     if row['maintenanceHours'] > 4.5:   score += 2
     elif row['maintenanceHours'] > 4.0: score += 1
 
     if score >= 6:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
+
+
+# ─────────────────────────────────────────────
+# FIX: Spike-aware feature aggregation
+#
+# Problem: Using pure median collapses 7 rows into 1 and smooths away
+# critical spikes. e.g. defects=[2,3,12,4,3,2,3] → median=3 (12 ignored!)
+#
+# Solution: For spike-sensitive features, use MAX.
+#           For stable features, use MEDIAN.
+# This ensures a single bad day still raises an alert.
+# ─────────────────────────────────────────────
+
+def aggregate_features(df):
+    """
+    Aggregate a multi-row dataframe into a single feature vector.
+    Spike features → max (catches worst-case days)
+    Stable features → median (smooths noise)
+    """
+    result = {}
+    for col in FEATURES:
+        if col in df.columns:
+            if col in SPIKE_FEATURES:
+                result[col] = df[col].max()   # catch spikes
+            else:
+                result[col] = df[col].median() # smooth noise
+    return pd.Series(result)
 
 
 # ─────────────────────────────────────────────
@@ -110,6 +136,49 @@ def impute(df):
             else:
                 df[col] = df[col].fillna(df[col].median())
     return df
+
+
+# ─────────────────────────────────────────────
+# Build feature vector from dataframe
+# Uses spike-aware aggregation + fallback to auto_label
+# ─────────────────────────────────────────────
+
+def build_feature_vector(df):
+    """
+    Aggregate rows into a single feature vector using spike-aware method.
+    Returns (feature_array, aggregated_series)
+    """
+    agg = aggregate_features(df)
+    return agg.values.reshape(1, -1), agg
+
+
+def predict_with_fallback(feature_array, agg_series, confidence_threshold=80.0):
+    """
+    Run RF prediction. If confidence is below threshold, fallback to
+    auto_label rules which are guaranteed to be consistent with training labels.
+
+    Returns: (label, confidence, probabilities, method_used)
+    """
+    pred  = rf_model.predict(feature_array)[0]
+    proba = rf_model.predict_proba(feature_array)[0]
+    label = le.inverse_transform([pred])[0]
+    confidence = round(float(max(proba)) * 100, 1)
+
+    class_probs = {
+        cls: round(float(p) * 100, 1)
+        for cls, p in zip(le.classes_, proba)
+    }
+
+    # FIX: If RF confidence is low, fallback to rule-based auto_label
+    # This handles boundary cases where RF contradicts its own training labels
+    if confidence < confidence_threshold:
+        rule_label = auto_label(agg_series)
+        logging.info(
+            f"Low RF confidence ({confidence}%) → falling back to auto_label: {rule_label}"
+        )
+        return rule_label, confidence, class_probs, "auto_label_fallback"
+
+    return label, confidence, class_probs, "random_forest"
 
 
 # ─────────────────────────────────────────────
@@ -156,22 +225,20 @@ def _train_core(df):
     y = le.fit_transform(df['label'])
 
     # Time-aware train/test split — sort by date so test set is always
-    # the most recent 20% of records. A random split leaks future data
-    # into training, which inflates accuracy on sequential data.
+    # the most recent 20% of records
     split_idx = int(len(df) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
     rf_model = RandomForestClassifier(
-        n_estimators=500,       # increased from 300 → better stability
+        n_estimators=500,
         class_weight="balanced",
-        min_samples_leaf=3,     # lowered from 5 → helps Critical (small class)
-        max_features="sqrt",    # explicit best practice for RF
+        min_samples_leaf=3,
+        max_features="sqrt",
         random_state=42
     )
     rf_model.fit(X_train, y_train)
 
-    # Log a proper per-class evaluation report
     if len(X_test) > 0:
         y_pred = rf_model.predict(X_test)
         report = classification_report(
@@ -311,6 +378,8 @@ def predict():
         if rf_model is None:
             return jsonify({"error": "Model not trained yet. Call /retrain first."})
 
+        # FIX: Minimum row count guard — unreliable to predict on < 3 records
+        MIN_ROWS = 3
         today = datetime.today().strftime("%Y-%m-%d")
         with engine.connect() as conn:
             df = pd.read_sql(
@@ -321,26 +390,32 @@ def predict():
                 """),
                 conn, params={"mid": machine_id, "d": today}
             )
+
         if df.empty:
             return jsonify({"error": f"No data found for machine {machine_id}"})
 
+        if len(df) < MIN_ROWS:
+            return jsonify({
+                "error": f"Not enough data for machine {machine_id}. "
+                         f"Found {len(df)} record(s), need at least {MIN_ROWS}."
+            })
+
         df = impute(df)
 
-        row = df[FEATURES].median().values.reshape(1, -1)
-        pred  = rf_model.predict(row)[0]
-        proba = rf_model.predict_proba(row)[0]
-        label = le.inverse_transform([pred])[0]
+        # FIX: Use spike-aware aggregation instead of pure median
+        feature_array, agg_series = build_feature_vector(df)
 
-        class_probs = {
-            cls: round(float(p) * 100, 1)
-            for cls, p in zip(le.classes_, proba)
-        }
+        label, confidence, class_probs, method = predict_with_fallback(
+            feature_array, agg_series
+        )
 
         return jsonify({
             "machineID":     machine_id,
             "status":        label,
-            "confidence":    round(float(max(proba)) * 100, 1),
-            "probabilities": class_probs
+            "confidence":    confidence,
+            "probabilities": class_probs,
+            "rows_used":     len(df),
+            "method":        method   # tells you if RF or fallback was used
         })
 
     except Exception as e:
@@ -379,25 +454,31 @@ def predict_raw():
         if not records:
             return jsonify({"error": "No records provided"}), 400
 
+        # FIX: Minimum row count guard
+        MIN_ROWS = 3
+        if len(records) < MIN_ROWS:
+            return jsonify({
+                "error": f"Not enough records provided. "
+                         f"Got {len(records)}, need at least {MIN_ROWS}."
+            }), 400
+
         df = pd.DataFrame(records)
         df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
         df = impute(df)
 
-        row   = df[FEATURES].median().values.reshape(1, -1)
-        pred  = rf_model.predict(row)[0]
-        proba = rf_model.predict_proba(row)[0]
-        label = le.inverse_transform([pred])[0]
+        # FIX: Use spike-aware aggregation instead of pure median
+        feature_array, agg_series = build_feature_vector(df)
 
-        class_probs = {
-            cls: round(float(p) * 100, 1)
-            for cls, p in zip(le.classes_, proba)
-        }
+        label, confidence, class_probs, method = predict_with_fallback(
+            feature_array, agg_series
+        )
 
         return jsonify({
             "status":        label,
-            "confidence":    round(float(max(proba)) * 100, 1),
+            "confidence":    confidence,
             "probabilities": class_probs,
-            "rows_used":     len(df)
+            "rows_used":     len(df),
+            "method":        method
         })
 
     except Exception as e:
