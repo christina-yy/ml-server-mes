@@ -39,7 +39,7 @@ FEATURES = [
 
 # Spike-sensitive features — use max instead of median
 # These are features where a single bad day matters more than the average
-SPIKE_FEATURES = ['defects', 'scrapRate', 'downTimeHours', 'qualityChecksFailed', 'reworkHours']
+# SPIKE_FEATURES = ['defects', 'scrapRate', 'downTimeHours', 'qualityChecksFailed', 'reworkHours']
 
 rf_model = None
 le = LabelEncoder()
@@ -108,20 +108,18 @@ def auto_label(row):
 # ─────────────────────────────────────────────
 
 def aggregate_features(df):
-    """
-    Aggregate a multi-row dataframe into a single feature vector.
-    Spike features → max (catches worst-case days)
-    Stable features → median (smooths noise)
-    """
+    """Weight recent rows more heavily than older ones."""
+    df = df.sort_values('date').reset_index(drop=True)
+    n = len(df)
+    # Linear weights: oldest=1, newest=n
+    weights = np.arange(1, n + 1, dtype=float)
+    weights /= weights.sum()  # normalise to sum=1
+
     result = {}
     for col in FEATURES:
         if col in df.columns:
-            if col in SPIKE_FEATURES:
-                result[col] = df[col].max()   # catch spikes
-            else:
-                result[col] = df[col].median() # smooth noise
+            result[col] = float(np.average(df[col].values, weights=weights))
     return pd.Series(result)
-
 
 # ─────────────────────────────────────────────
 # Impute nulls with training-set medians
