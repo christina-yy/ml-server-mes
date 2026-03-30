@@ -6,11 +6,11 @@ import pandas as pd
 import sqlalchemy
 import os
 import logging
+import shap
 from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, confusion_matrix
 
 app = Flask(__name__)
 CORS(app)
@@ -37,92 +37,189 @@ FEATURES = [
     'averageTemperature', 'averageHumidityPercent'
 ]
 
-# Spike-sensitive features — use max instead of median
-# These are features where a single bad day matters more than the average
-# SPIKE_FEATURES = ['defects', 'scrapRate', 'downTimeHours', 'qualityChecksFailed', 'reworkHours']
+# Human-readable labels for each feature
+FEATURE_LABELS = {
+    'defects':                 'Defects',
+    'scrapRate':               'Scrap Rate',
+    'downTimeHours':           'Downtime (hrs)',
+    'energyConsumption':       'Energy Consumption',
+    'maintenanceHours':        'Maintenance (hrs)',
+    'reworkHours':             'Rework (hrs)',
+    'qualityChecksFailed':     'Quality Checks Failed',
+    'averageTemperature':      'Avg Temperature',
+    'averageHumidityPercent':  'Avg Humidity (%)',
+}
 
-rf_model = None
-le = LabelEncoder()
-
-# Median values from training data — used to impute nulls at prediction time
-_feature_medians = {}
+rf_model   = None
+le         = LabelEncoder()
+_shap_explainer    = None   # TreeExplainer — built once after training
+_feature_medians   = {}
 
 
 # ─────────────────────────────────────────────
-# Auto Label  (v4 — spike-aware thresholds)
-#
-# Changes from v3:
-#   • Uses MAX values for spike features instead of median
-#     (defects, scrapRate, downTimeHours, qualityChecksFailed, reworkHours)
-#   • Stable features (energy, maintenance, temp, humidity) still use median
-#   • This prevents single bad-day spikes from being smoothed away
-#   • Thresholds re-validated against full dataset percentiles:
-#       downtime p75=2.3, p90=2.72 → >2.5 is genuinely high (top ~18%)
-#       scrapRate p75=0.04, p90=0.046 → thresholds confirmed correct
-#       defects p75=7, p90=9 → thresholds confirmed correct
+# Auto Label  (v4)
 # ─────────────────────────────────────────────
 
 def auto_label(row):
     score = 0
 
-    # Defects (dataset max=34; p75=7, p90=9)
     if row['defects'] > 15:             score += 4
+    elif row['defects'] > 12:           score += 3
     elif row['defects'] > 9:            score += 2
     elif row['defects'] > 7:            score += 1
 
-    # Scrap Rate — top feature by importance (p75=0.04, p90=0.046)
     if row['scrapRate'] > 0.046:        score += 3
     elif row['scrapRate'] > 0.040:      score += 2
     elif row['scrapRate'] > 0.030:      score += 1
 
-    # Downtime (p75=2.3h, p90=2.72h — >2.5 is top ~18%)
     if row['downTimeHours'] > 2.5:      score += 2
     elif row['downTimeHours'] > 1.5:    score += 1
 
-    # Rework hours (p75=1.49h, p90=1.82h)
     if row['reworkHours'] > 1.8:        score += 1
     elif row['reworkHours'] > 1.4:      score += 0.5
 
-    # Quality checks failed (values: 0, 1, 2)
     if row['qualityChecksFailed'] == 2: score += 2
     elif row['qualityChecksFailed'] == 1: score += 1
 
-    # Maintenance hours (p75=3.76h, p90=4.5h)
     if row['maintenanceHours'] > 4.5:   score += 2
     elif row['maintenanceHours'] > 4.0: score += 1
 
-    if score >= 6:   return "Critical"
+    if score >= 5:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
 
 
 # ─────────────────────────────────────────────
-# FIX: Spike-aware feature aggregation
-#
-# Problem: Using pure median collapses 7 rows into 1 and smooths away
-# critical spikes. e.g. defects=[2,3,12,4,3,2,3] → median=3 (12 ignored!)
-#
-# Solution: For spike-sensitive features, use MAX.
-#           For stable features, use MEDIAN.
-# This ensures a single bad day still raises an alert.
+# Rule-based Explanation
 # ─────────────────────────────────────────────
 
-def aggregate_features(df):
-    """Weight recent rows more heavily than older ones."""
-    df = df.sort_values('date').reset_index(drop=True)
-    n = len(df)
-    # Linear weights: oldest=1, newest=n
-    weights = np.arange(1, n + 1, dtype=float)
-    weights /= weights.sum()  # normalise to sum=1
+def explain_label(row):
+    """
+    Mirror of auto_label() that returns human-readable reasons
+    for every threshold that was triggered, plus the total score.
+    """
+    reasons = []
+    score   = 0
 
-    result = {}
-    for col in FEATURES:
-        if col in df.columns:
-            result[col] = float(np.average(df[col].values, weights=weights))
-    return pd.Series(result)
+    # --- Defects ---
+    if row['defects'] > 15:
+        score += 4
+        reasons.append(f"Defects critically high ({row['defects']:.0f} units — threshold >15)")
+    elif row['defects'] > 12:
+        score += 3
+        reasons.append(f"Defects very high ({row['defects']:.0f} units — threshold >12)")
+    elif row['defects'] > 9:
+        score += 2
+        reasons.append(f"Defects elevated ({row['defects']:.0f} units — threshold >9)")
+    elif row['defects'] > 7:
+        score += 1
+        reasons.append(f"Defects slightly above normal ({row['defects']:.0f} units — threshold >7)")
+
+    # --- Scrap Rate ---
+    if row['scrapRate'] > 0.046:
+        score += 3
+        reasons.append(f"Scrap rate critically high ({row['scrapRate']:.4f} — threshold >0.046)")
+    elif row['scrapRate'] > 0.040:
+        score += 2
+        reasons.append(f"Scrap rate elevated ({row['scrapRate']:.4f} — threshold >0.040)")
+    elif row['scrapRate'] > 0.030:
+        score += 1
+        reasons.append(f"Scrap rate slightly above normal ({row['scrapRate']:.4f} — threshold >0.030)")
+
+    # --- Downtime ---
+    if row['downTimeHours'] > 2.5:
+        score += 2
+        reasons.append(f"Downtime high ({row['downTimeHours']:.2f}h — threshold >2.5h)")
+    elif row['downTimeHours'] > 1.5:
+        score += 1
+        reasons.append(f"Downtime moderately elevated ({row['downTimeHours']:.2f}h — threshold >1.5h)")
+
+    # --- Rework ---
+    if row['reworkHours'] > 1.8:
+        score += 1
+        reasons.append(f"Rework hours high ({row['reworkHours']:.2f}h — threshold >1.8h)")
+    elif row['reworkHours'] > 1.4:
+        score += 0.5
+        reasons.append(f"Rework hours slightly elevated ({row['reworkHours']:.2f}h — threshold >1.4h)")
+
+    # --- Quality Checks ---
+    if row['qualityChecksFailed'] == 2:
+        score += 2
+        reasons.append("Quality checks failed: both checks failed (2/2)")
+    elif row['qualityChecksFailed'] == 1:
+        score += 1
+        reasons.append("Quality checks failed: 1 out of 2 checks failed")
+
+    # --- Maintenance ---
+    if row['maintenanceHours'] > 4.5:
+        score += 2
+        reasons.append(f"Maintenance hours very high ({row['maintenanceHours']:.2f}h — threshold >4.5h)")
+    elif row['maintenanceHours'] > 4.0:
+        score += 1
+        reasons.append(f"Maintenance hours elevated ({row['maintenanceHours']:.2f}h — threshold >4.0h)")
+
+    # --- Healthy fallback ---
+    if not reasons:
+        reasons.append("All key metrics are within normal operating ranges.")
+
+    return {"score": score, "reasons": reasons}
+
 
 # ─────────────────────────────────────────────
-# Impute nulls with training-set medians
+# SHAP Feature Importance Explanation
+# ─────────────────────────────────────────────
+
+def get_shap_explanation(row_values: np.ndarray, predicted_class_idx: int, top_n: int = 5):
+    """
+    Uses the cached TreeExplainer to compute SHAP values for a single
+    prediction row.  Returns the top_n features driving the predicted class,
+    sorted by absolute SHAP value (highest impact first).
+
+    Args:
+        row_values:          1-D numpy array of feature values (len == len(FEATURES))
+        predicted_class_idx: index into le.classes_ for the predicted label
+        top_n:               how many features to return
+
+    Returns:
+        List of dicts: [{feature, label, value, shap_value, direction}, ...]
+    """
+    if _shap_explainer is None:
+        return []
+
+    try:
+        row_2d    = row_values.reshape(1, -1)
+        # shap_values shape: (n_classes, n_samples, n_features)
+        sv        = _shap_explainer.shap_values(row_2d)
+        class_sv  = sv[predicted_class_idx][0]          # shape: (n_features,)
+
+        # Pair each feature with its SHAP value for the predicted class
+        paired = sorted(
+            zip(FEATURES, class_sv),
+            key=lambda x: abs(x[1]),
+            reverse=True
+        )[:top_n]
+
+        drivers = []
+        for feat, sv_val in paired:
+            feat_val = row_values[FEATURES.index(feat)]
+            drivers.append({
+                "feature":    feat,
+                "label":      FEATURE_LABELS.get(feat, feat),
+                "value":      round(float(feat_val), 4),
+                "shap_value": round(float(sv_val), 4),
+                # positive → pushes toward predicted class; negative → pushes away
+                "direction":  "increases risk" if sv_val > 0 else "decreases risk",
+            })
+
+        return drivers
+
+    except Exception as e:
+        logging.warning(f"SHAP explanation failed: {e}")
+        return []
+
+
+# ─────────────────────────────────────────────
+# Impute
 # ─────────────────────────────────────────────
 
 def impute(df):
@@ -134,49 +231,6 @@ def impute(df):
             else:
                 df[col] = df[col].fillna(df[col].median())
     return df
-
-
-# ─────────────────────────────────────────────
-# Build feature vector from dataframe
-# Uses spike-aware aggregation + fallback to auto_label
-# ─────────────────────────────────────────────
-
-def build_feature_vector(df):
-    """
-    Aggregate rows into a single feature vector using spike-aware method.
-    Returns (feature_array, aggregated_series)
-    """
-    agg = aggregate_features(df)
-    return agg.values.reshape(1, -1), agg
-
-
-def predict_with_fallback(feature_array, agg_series, confidence_threshold=80.0):
-    """
-    Run RF prediction. If confidence is below threshold, fallback to
-    auto_label rules which are guaranteed to be consistent with training labels.
-
-    Returns: (label, confidence, probabilities, method_used)
-    """
-    pred  = rf_model.predict(feature_array)[0]
-    proba = rf_model.predict_proba(feature_array)[0]
-    label = le.inverse_transform([pred])[0]
-    confidence = round(float(max(proba)) * 100, 1)
-
-    class_probs = {
-        cls: round(float(p) * 100, 1)
-        for cls, p in zip(le.classes_, proba)
-    }
-
-    # FIX: If RF confidence is low, fallback to rule-based auto_label
-    # This handles boundary cases where RF contradicts its own training labels
-    if confidence < confidence_threshold:
-        rule_label = auto_label(agg_series)
-        logging.info(
-            f"Low RF confidence ({confidence}%) → falling back to auto_label: {rule_label}"
-        )
-        return rule_label, confidence, class_probs, "auto_label_fallback"
-
-    return label, confidence, class_probs, "random_forest"
 
 
 # ─────────────────────────────────────────────
@@ -195,25 +249,22 @@ def train_model():
         if df.empty:
             logging.warning("No training data found — model not trained.")
             return
-
         _train_core(df)
-
     except Exception as e:
         logging.error(f"train_model() failed: {e}")
 
 
 def _train_core(df):
-    """Shared training logic used by both /retrain and /retrain-raw."""
-    global rf_model, le, _feature_medians
+    """Shared training logic — also rebuilds the SHAP TreeExplainer."""
+    global rf_model, le, _feature_medians, _shap_explainer
 
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
 
-    # Store medians BEFORE imputing so they reflect real data distribution
     for col in FEATURES:
         if col in df.columns:
             _feature_medians[col] = df[col].median()
 
-    df = impute(df)
+    df      = impute(df)
     df['label'] = df.apply(auto_label, axis=1)
 
     label_counts = df['label'].value_counts().to_dict()
@@ -222,29 +273,44 @@ def _train_core(df):
     X = df[FEATURES].values
     y = le.fit_transform(df['label'])
 
-    # Time-aware train/test split — sort by date so test set is always
-    # the most recent 20% of records
-    split_idx = int(len(df) * 0.8)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
+    cw = {
+        i: (3 if cls == "Critical" else 1)
+        for i, cls in enumerate(le.classes_)
+    }
+
+    split_idx         = int(len(df) * 0.8)
+    X_train, X_test   = X[:split_idx], X[split_idx:]
+    y_train, y_test   = y[:split_idx], y[split_idx:]
 
     rf_model = RandomForestClassifier(
         n_estimators=500,
-        class_weight="balanced",
+        class_weight=cw,
         min_samples_leaf=3,
         max_features="sqrt",
         random_state=42
     )
     rf_model.fit(X_train, y_train)
 
+    # ── Rebuild SHAP explainer after every train ──────────────────────────
+    try:
+        _shap_explainer = shap.TreeExplainer(rf_model)
+        logging.info("SHAP TreeExplainer built successfully.")
+    except Exception as e:
+        logging.warning(f"SHAP TreeExplainer failed to build: {e}")
+        _shap_explainer = None
+
     if len(X_test) > 0:
         y_pred = rf_model.predict(X_test)
-        report = classification_report(
-            y_test, y_pred,
-            target_names=le.classes_,
-            zero_division=0
+        report = classification_report(y_test, y_pred, target_names=le.classes_, zero_division=0)
+        logging.info(f"Classification report:\n{report}")
+
+        cm         = confusion_matrix(y_test, y_pred)
+        cm_header  = f"{'':>12}" + "".join(f"{c:>12}" for c in le.classes_)
+        cm_rows    = "\n".join(
+            f"{le.classes_[i]:>12}" + "".join(f"{v:>12}" for v in row)
+            for i, row in enumerate(cm)
         )
-        logging.info(f"Classification report (time-aware test split):\n{report}")
+        logging.info(f"Confusion matrix:\n{cm_header}\n{cm_rows}")
 
     logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
     return label_counts
@@ -254,7 +320,7 @@ train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent Keywords Map
+# Intent / Parse helpers  (unchanged)
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -282,6 +348,8 @@ INTENT_KEYWORDS = {
     "production_id":   ["production id", "production ids", "record id", "record ids", "list records", "all records"],
     "material_cost":   ["material cost", "material cost per unit", "material price"],
     "labour_cost":     ["labour cost", "labor cost", "labour cost per unit", "labor cost per unit", "labour price", "worker cost"],
+    # ── NEW: catches "why is machine X..." questions ──────────────────────
+    "why":             ["why", "reason", "explain", "cause", "because", "how come"],
 }
 
 INTENT_FIELD_MAP = {
@@ -293,12 +361,14 @@ INTENT_FIELD_MAP = {
     "shift": "shift", "machine_id": "machineID", "production_time": "ProductionTime",
     "product_type": "productType", "production_id": "productionID",
     "material_cost": "materialCostPerUnit", "labour_cost": "labourCostPerUnit",
+    "why": None,   # routes to /predict — explanation is embedded in response
 }
 
 
 def detect_intent(text):
     text = text.lower()
-    for priority in ["predict", "compare", "top", "summary"]:
+    # "why" checked first — before predict/compare/top/summary
+    for priority in ["why", "predict", "compare", "top", "summary"]:
         if any(k in text for k in INTENT_KEYWORDS[priority]):
             return priority
     scores = {i: sum(1 for kw in kws if kw in text) for i, kws in INTENT_KEYWORDS.items()}
@@ -335,9 +405,10 @@ def extract_compare_machines(text):
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
-        "status":      "ok",
-        "model_ready": rf_model is not None,
-        "timestamp":   datetime.now().isoformat()
+        "status":       "ok",
+        "model_ready":  rf_model is not None,
+        "shap_ready":   _shap_explainer is not None,
+        "timestamp":    datetime.now().isoformat()
     })
 
 
@@ -366,7 +437,7 @@ def parse():
 
 
 # ─────────────────────────────────────────────
-# Predict Route  (DB-based)
+# Predict Route  — now includes rule + SHAP explanation
 # ─────────────────────────────────────────────
 
 @app.route("/predict", methods=["POST"])
@@ -376,8 +447,6 @@ def predict():
         if rf_model is None:
             return jsonify({"error": "Model not trained yet. Call /retrain first."})
 
-        # FIX: Minimum row count guard — unreliable to predict on < 3 records
-        MIN_ROWS = 3
         today = datetime.today().strftime("%Y-%m-%d")
         with engine.connect() as conn:
             df = pd.read_sql(
@@ -388,32 +457,40 @@ def predict():
                 """),
                 conn, params={"mid": machine_id, "d": today}
             )
-
         if df.empty:
             return jsonify({"error": f"No data found for machine {machine_id}"})
 
-        if len(df) < MIN_ROWS:
-            return jsonify({
-                "error": f"Not enough data for machine {machine_id}. "
-                         f"Found {len(df)} record(s), need at least {MIN_ROWS}."
-            })
+        df  = impute(df)
+        row = df[FEATURES].median()              # representative snapshot
+        row_values = row.values.reshape(1, -1)
 
-        df = impute(df)
+        pred  = rf_model.predict(row_values)[0]
+        proba = rf_model.predict_proba(row_values)[0]
+        label = le.inverse_transform([pred])[0]
 
-        # FIX: Use spike-aware aggregation instead of pure median
-        feature_array, agg_series = build_feature_vector(df)
+        class_probs = {
+            cls: round(float(p) * 100, 1)
+            for cls, p in zip(le.classes_, proba)
+        }
 
-        label, confidence, class_probs, method = predict_with_fallback(
-            feature_array, agg_series
-        )
+        # ── Rule-based explanation ────────────────────────────────────────
+        rule_exp   = explain_label(row)
+
+        # ── SHAP feature importance for the predicted class ───────────────
+        pred_class_idx   = int(pred)
+        shap_drivers     = get_shap_explanation(row.values, pred_class_idx, top_n=5)
 
         return jsonify({
-            "machineID":     machine_id,
-            "status":        label,
-            "confidence":    confidence,
-            "probabilities": class_probs,
-            "rows_used":     len(df),
-            "method":        method   # tells you if RF or fallback was used
+            "machineID":       machine_id,
+            "status":          label,
+            "confidence":      round(float(max(proba)) * 100, 1),
+            "probabilities":   class_probs,
+            # --- explanation block ---
+            "explanation": {
+                "score":           rule_exp["score"],
+                "reasons":         rule_exp["reasons"],      # rule-based triggers
+                "feature_drivers": shap_drivers,             # SHAP top-5 features
+            }
         })
 
     except Exception as e:
@@ -422,7 +499,7 @@ def predict():
 
 
 # ─────────────────────────────────────────────
-# Retrain Route  (DB-based)
+# Retrain Route
 # ─────────────────────────────────────────────
 
 @app.route("/retrain", methods=["POST"])
@@ -431,7 +508,8 @@ def retrain():
         train_model()
         return jsonify({
             "message":     "Model retrained successfully",
-            "model_ready": rf_model is not None
+            "model_ready": rf_model is not None,
+            "shap_ready":  _shap_explainer is not None,
         })
     except Exception as e:
         logging.error(f"/retrain error: {e}")
@@ -439,44 +517,48 @@ def retrain():
 
 
 # ─────────────────────────────────────────────
-# Predict Raw  (browser sends records directly)
+# Predict Raw
 # ─────────────────────────────────────────────
 
 @app.route("/predict-raw", methods=["POST"])
 def predict_raw():
     try:
         if rf_model is None:
-            return jsonify({"error": "Model not trained yet. Ask me to retrain first."}), 400
+            return jsonify({"error": "Model not trained yet."}), 400
 
         records = request.json.get("records", [])
         if not records:
             return jsonify({"error": "No records provided"}), 400
 
-        # FIX: Minimum row count guard
-        MIN_ROWS = 3
-        if len(records) < MIN_ROWS:
-            return jsonify({
-                "error": f"Not enough records provided. "
-                         f"Got {len(records)}, need at least {MIN_ROWS}."
-            }), 400
-
         df = pd.DataFrame(records)
         df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
         df = impute(df)
 
-        # FIX: Use spike-aware aggregation instead of pure median
-        feature_array, agg_series = build_feature_vector(df)
+        row        = df[FEATURES].median()
+        row_values = row.values.reshape(1, -1)
 
-        label, confidence, class_probs, method = predict_with_fallback(
-            feature_array, agg_series
-        )
+        pred  = rf_model.predict(row_values)[0]
+        proba = rf_model.predict_proba(row_values)[0]
+        label = le.inverse_transform([pred])[0]
+
+        class_probs = {
+            cls: round(float(p) * 100, 1)
+            for cls, p in zip(le.classes_, proba)
+        }
+
+        rule_exp       = explain_label(row)
+        shap_drivers   = get_shap_explanation(row.values, int(pred), top_n=5)
 
         return jsonify({
             "status":        label,
-            "confidence":    confidence,
+            "confidence":    round(float(max(proba)) * 100, 1),
             "probabilities": class_probs,
             "rows_used":     len(df),
-            "method":        method
+            "explanation": {
+                "score":           rule_exp["score"],
+                "reasons":         rule_exp["reasons"],
+                "feature_drivers": shap_drivers,
+            }
         })
 
     except Exception as e:
@@ -485,7 +567,7 @@ def predict_raw():
 
 
 # ─────────────────────────────────────────────
-# Retrain Raw  (browser sends all records)
+# Retrain Raw
 # ─────────────────────────────────────────────
 
 @app.route("/retrain-raw", methods=["POST"])
@@ -507,7 +589,8 @@ def retrain_raw():
             "rows_used":    len(df),
             "classes":      list(le.classes_),
             "label_counts": label_counts,
-            "model_ready":  True
+            "model_ready":  True,
+            "shap_ready":   _shap_explainer is not None,
         })
 
     except Exception as e:
