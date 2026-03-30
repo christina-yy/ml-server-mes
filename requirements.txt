@@ -6,3 +6,4 @@ numpy
 pymysql
 sqlalchemy
 gunicorn
+shap
