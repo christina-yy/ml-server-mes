@@ -6,7 +6,6 @@ import pandas as pd
 import sqlalchemy
 import os
 import logging
-import shap
 from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
@@ -37,7 +36,6 @@ FEATURES = [
     'averageTemperature', 'averageHumidityPercent'
 ]
 
-# Human-readable labels for each feature
 FEATURE_LABELS = {
     'defects':                 'Defects',
     'scrapRate':               'Scrap Rate',
@@ -50,14 +48,13 @@ FEATURE_LABELS = {
     'averageHumidityPercent':  'Avg Humidity (%)',
 }
 
-rf_model   = None
-le         = LabelEncoder()
-_shap_explainer    = None   # TreeExplainer — built once after training
-_feature_medians   = {}
+rf_model         = None
+le               = LabelEncoder()
+_feature_medians = {}
 
 
 # ─────────────────────────────────────────────
-# Auto Label  (v4)
+# Auto Label
 # ─────────────────────────────────────────────
 
 def auto_label(row):
@@ -94,10 +91,6 @@ def auto_label(row):
 # ─────────────────────────────────────────────
 
 def explain_label(row):
-    """
-    Mirror of auto_label() that returns human-readable reasons
-    for every threshold that was triggered, plus the total score.
-    """
     reasons = []
     score   = 0
 
@@ -166,59 +159,6 @@ def explain_label(row):
 
 
 # ─────────────────────────────────────────────
-# SHAP Feature Importance Explanation
-# ─────────────────────────────────────────────
-
-def get_shap_explanation(row_values: np.ndarray, predicted_class_idx: int, top_n: int = 5):
-    """
-    Uses the cached TreeExplainer to compute SHAP values for a single
-    prediction row.  Returns the top_n features driving the predicted class,
-    sorted by absolute SHAP value (highest impact first).
-
-    Args:
-        row_values:          1-D numpy array of feature values (len == len(FEATURES))
-        predicted_class_idx: index into le.classes_ for the predicted label
-        top_n:               how many features to return
-
-    Returns:
-        List of dicts: [{feature, label, value, shap_value, direction}, ...]
-    """
-    if _shap_explainer is None:
-        return []
-
-    try:
-        row_2d    = row_values.reshape(1, -1)
-        # shap_values shape: (n_classes, n_samples, n_features)
-        sv        = _shap_explainer.shap_values(row_2d)
-        class_sv  = sv[predicted_class_idx][0]          # shape: (n_features,)
-
-        # Pair each feature with its SHAP value for the predicted class
-        paired = sorted(
-            zip(FEATURES, class_sv),
-            key=lambda x: abs(x[1]),
-            reverse=True
-        )[:top_n]
-
-        drivers = []
-        for feat, sv_val in paired:
-            feat_val = row_values[FEATURES.index(feat)]
-            drivers.append({
-                "feature":    feat,
-                "label":      FEATURE_LABELS.get(feat, feat),
-                "value":      round(float(feat_val), 4),
-                "shap_value": round(float(sv_val), 4),
-                # positive → pushes toward predicted class; negative → pushes away
-                "direction":  "increases risk" if sv_val > 0 else "decreases risk",
-            })
-
-        return drivers
-
-    except Exception as e:
-        logging.warning(f"SHAP explanation failed: {e}")
-        return []
-
-
-# ─────────────────────────────────────────────
 # Impute
 # ─────────────────────────────────────────────
 
@@ -255,8 +195,7 @@ def train_model():
 
 
 def _train_core(df):
-    """Shared training logic — also rebuilds the SHAP TreeExplainer."""
-    global rf_model, le, _feature_medians, _shap_explainer
+    global rf_model, le, _feature_medians
 
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
 
@@ -264,7 +203,7 @@ def _train_core(df):
         if col in df.columns:
             _feature_medians[col] = df[col].median()
 
-    df      = impute(df)
+    df          = impute(df)
     df['label'] = df.apply(auto_label, axis=1)
 
     label_counts = df['label'].value_counts().to_dict()
@@ -278,9 +217,9 @@ def _train_core(df):
         for i, cls in enumerate(le.classes_)
     }
 
-    split_idx         = int(len(df) * 0.8)
-    X_train, X_test   = X[:split_idx], X[split_idx:]
-    y_train, y_test   = y[:split_idx], y[split_idx:]
+    split_idx       = int(len(df) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
 
     rf_model = RandomForestClassifier(
         n_estimators=500,
@@ -291,22 +230,14 @@ def _train_core(df):
     )
     rf_model.fit(X_train, y_train)
 
-    # ── Rebuild SHAP explainer after every train ──────────────────────────
-    try:
-        _shap_explainer = shap.TreeExplainer(rf_model)
-        logging.info("SHAP TreeExplainer built successfully.")
-    except Exception as e:
-        logging.warning(f"SHAP TreeExplainer failed to build: {e}")
-        _shap_explainer = None
-
     if len(X_test) > 0:
         y_pred = rf_model.predict(X_test)
         report = classification_report(y_test, y_pred, target_names=le.classes_, zero_division=0)
         logging.info(f"Classification report:\n{report}")
 
-        cm         = confusion_matrix(y_test, y_pred)
-        cm_header  = f"{'':>12}" + "".join(f"{c:>12}" for c in le.classes_)
-        cm_rows    = "\n".join(
+        cm        = confusion_matrix(y_test, y_pred)
+        cm_header = f"{'':>12}" + "".join(f"{c:>12}" for c in le.classes_)
+        cm_rows   = "\n".join(
             f"{le.classes_[i]:>12}" + "".join(f"{v:>12}" for v in row)
             for i, row in enumerate(cm)
         )
@@ -320,7 +251,7 @@ train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent / Parse helpers  (unchanged)
+# Intent / Parse helpers
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -348,7 +279,6 @@ INTENT_KEYWORDS = {
     "production_id":   ["production id", "production ids", "record id", "record ids", "list records", "all records"],
     "material_cost":   ["material cost", "material cost per unit", "material price"],
     "labour_cost":     ["labour cost", "labor cost", "labour cost per unit", "labor cost per unit", "labour price", "worker cost"],
-    # ── NEW: catches "why is machine X..." questions ──────────────────────
     "why":             ["why", "reason", "explain", "cause", "because", "how come"],
 }
 
@@ -361,13 +291,12 @@ INTENT_FIELD_MAP = {
     "shift": "shift", "machine_id": "machineID", "production_time": "ProductionTime",
     "product_type": "productType", "production_id": "productionID",
     "material_cost": "materialCostPerUnit", "labour_cost": "labourCostPerUnit",
-    "why": None,   # routes to /predict — explanation is embedded in response
+    "why": None,
 }
 
 
 def detect_intent(text):
     text = text.lower()
-    # "why" checked first — before predict/compare/top/summary
     for priority in ["why", "predict", "compare", "top", "summary"]:
         if any(k in text for k in INTENT_KEYWORDS[priority]):
             return priority
@@ -405,10 +334,9 @@ def extract_compare_machines(text):
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
-        "status":       "ok",
-        "model_ready":  rf_model is not None,
-        "shap_ready":   _shap_explainer is not None,
-        "timestamp":    datetime.now().isoformat()
+        "status":      "ok",
+        "model_ready": rf_model is not None,
+        "timestamp":   datetime.now().isoformat()
     })
 
 
@@ -437,7 +365,7 @@ def parse():
 
 
 # ─────────────────────────────────────────────
-# Predict Route  — now includes rule + SHAP explanation
+# Predict Route
 # ─────────────────────────────────────────────
 
 @app.route("/predict", methods=["POST"])
@@ -460,8 +388,8 @@ def predict():
         if df.empty:
             return jsonify({"error": f"No data found for machine {machine_id}"})
 
-        df  = impute(df)
-        row = df[FEATURES].median()              # representative snapshot
+        df         = impute(df)
+        row        = df[FEATURES].median()
         row_values = row.values.reshape(1, -1)
 
         pred  = rf_model.predict(row_values)[0]
@@ -473,23 +401,16 @@ def predict():
             for cls, p in zip(le.classes_, proba)
         }
 
-        # ── Rule-based explanation ────────────────────────────────────────
-        rule_exp   = explain_label(row)
-
-        # ── SHAP feature importance for the predicted class ───────────────
-        pred_class_idx   = int(pred)
-        shap_drivers     = get_shap_explanation(row.values, pred_class_idx, top_n=5)
+        rule_exp = explain_label(row)
 
         return jsonify({
-            "machineID":       machine_id,
-            "status":          label,
-            "confidence":      round(float(max(proba)) * 100, 1),
-            "probabilities":   class_probs,
-            # --- explanation block ---
+            "machineID":     machine_id,
+            "status":        label,
+            "confidence":    round(float(max(proba)) * 100, 1),
+            "probabilities": class_probs,
             "explanation": {
-                "score":           rule_exp["score"],
-                "reasons":         rule_exp["reasons"],      # rule-based triggers
-                "feature_drivers": shap_drivers,             # SHAP top-5 features
+                "score":   rule_exp["score"],
+                "reasons": rule_exp["reasons"],
             }
         })
 
@@ -509,7 +430,6 @@ def retrain():
         return jsonify({
             "message":     "Model retrained successfully",
             "model_ready": rf_model is not None,
-            "shap_ready":  _shap_explainer is not None,
         })
     except Exception as e:
         logging.error(f"/retrain error: {e}")
@@ -546,8 +466,7 @@ def predict_raw():
             for cls, p in zip(le.classes_, proba)
         }
 
-        rule_exp       = explain_label(row)
-        shap_drivers   = get_shap_explanation(row.values, int(pred), top_n=5)
+        rule_exp = explain_label(row)
 
         return jsonify({
             "status":        label,
@@ -555,9 +474,8 @@ def predict_raw():
             "probabilities": class_probs,
             "rows_used":     len(df),
             "explanation": {
-                "score":           rule_exp["score"],
-                "reasons":         rule_exp["reasons"],
-                "feature_drivers": shap_drivers,
+                "score":   rule_exp["score"],
+                "reasons": rule_exp["reasons"],
             }
         })
 
@@ -579,8 +497,8 @@ def retrain_raw():
             return jsonify({"error": "No records provided"}), 400
 
         df = pd.DataFrame(records)
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
+        df['date']    = pd.to_datetime(df['date'], errors='coerce')
+        df[FEATURES]  = df[FEATURES].apply(pd.to_numeric, errors='coerce')
 
         label_counts = _train_core(df)
 
@@ -590,7 +508,6 @@ def retrain_raw():
             "classes":      list(le.classes_),
             "label_counts": label_counts,
             "model_ready":  True,
-            "shap_ready":   _shap_explainer is not None,
         })
 
     except Exception as e:
