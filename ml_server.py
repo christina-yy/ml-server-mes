@@ -10,6 +10,8 @@ from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from imblearn.over_sampling import SMOTE
 
 app = Flask(__name__)
 CORS(app)
@@ -81,7 +83,7 @@ def auto_label(row):
     if row['maintenanceHours'] > 4.5:   score += 2
     elif row['maintenanceHours'] > 4.0: score += 1
 
-    if score >= 5:   return "Critical"
+    if score >= 4:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
 
@@ -212,15 +214,39 @@ def _train_core(df):
     X = df[FEATURES].values
     y = le.fit_transform(df['label'])
 
-    cw = {
-        i: (6 if cls == "Critical" else 1)
-        for i, cls in enumerate(le.classes_)
-    }
-
+    # ─────────────────────────────────────────────
+    # Time-aware Train/Test Split (80/20)
+    # ─────────────────────────────────────────────
     split_idx       = int(len(df) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
+    # ─────────────────────────────────────────────
+    # SMOTE — Oversample Minority Classes
+    # ─────────────────────────────────────────────
+    try:
+        sm = SMOTE(random_state=42, k_neighbors=5)
+        X_train_sm, y_train_sm = sm.fit_resample(X_train, y_train)
+        logging.info(
+            f"SMOTE applied — "
+            f"before: {len(X_train)} rows, "
+            f"after: {len(X_train_sm)} rows"
+        )
+    except Exception as e:
+        logging.warning(f"SMOTE failed ({e}), using original training data.")
+        X_train_sm, y_train_sm = X_train, y_train
+
+    # ─────────────────────────────────────────────
+    # Class Weights
+    # ─────────────────────────────────────────────
+    cw = {
+        i: (5 if cls == "Critical" else 1)
+        for i, cls in enumerate(le.classes_)
+    }
+
+    # ─────────────────────────────────────────────
+    # Train Random Forest
+    # ─────────────────────────────────────────────
     rf_model = RandomForestClassifier(
         n_estimators=500,
         class_weight=cw,
@@ -228,11 +254,18 @@ def _train_core(df):
         max_features="sqrt",
         random_state=42
     )
-    rf_model.fit(X_train, y_train)
+    rf_model.fit(X_train_sm, y_train_sm)
 
+    # ─────────────────────────────────────────────
+    # Test Set Evaluation
+    # ─────────────────────────────────────────────
     if len(X_test) > 0:
         y_pred = rf_model.predict(X_test)
-        report = classification_report(y_test, y_pred, target_names=le.classes_, zero_division=0)
+        report = classification_report(
+            y_test, y_pred,
+            target_names=le.classes_,
+            zero_division=0
+        )
         logging.info(f"Classification report:\n{report}")
 
         cm        = confusion_matrix(y_test, y_pred)
@@ -243,6 +276,43 @@ def _train_core(df):
         )
         logging.info(f"Confusion matrix:\n{cm_header}\n{cm_rows}")
 
+    # ─────────────────────────────────────────────
+    # Cross Validation (5-Fold) on SMOTE Data
+    # ─────────────────────────────────────────────
+    try:
+        cv_model = RandomForestClassifier(
+            n_estimators=500,
+            class_weight=cw,
+            min_samples_leaf=3,
+            max_features="sqrt",
+            random_state=42
+        )
+
+        kf = StratifiedKFold(n_splits=5, shuffle=False)
+
+        cv_accuracy = cross_val_score(
+            cv_model, X_train_sm, y_train_sm,
+            cv=kf, scoring='accuracy'
+        )
+        cv_f1 = cross_val_score(
+            cv_model, X_train_sm, y_train_sm,
+            cv=kf, scoring='f1_macro'
+        )
+        cv_recall = cross_val_score(
+            cv_model, X_train_sm, y_train_sm,
+            cv=kf, scoring='recall_macro'
+        )
+
+        logging.info(
+            f"Cross Validation (5-fold):\n"
+            f"  Accuracy : {cv_accuracy.mean():.3f} ± {cv_accuracy.std():.3f}\n"
+            f"  F1 Macro : {cv_f1.mean():.3f} ± {cv_f1.std():.3f}\n"
+            f"  Recall   : {cv_recall.mean():.3f} ± {cv_recall.std():.3f}\n"
+            f"  Per-fold accuracy: {[round(s, 3) for s in cv_accuracy]}"
+        )
+    except Exception as e:
+        logging.warning(f"Cross validation failed: {e}")
+
     logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
     return label_counts
 
@@ -251,7 +321,7 @@ train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent / Parse helpers
+# Intent / Parse Helpers
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -283,15 +353,26 @@ INTENT_KEYWORDS = {
 }
 
 INTENT_FIELD_MAP = {
-    "units": "unitsProduced", "defects": "defects", "downtime": "downTimeHours",
-    "maintenance": "maintenanceHours", "scrap": "scrapRate", "rework": "reworkHours",
-    "quality": "qualityChecksFailed", "energy": "energyConsumption",
-    "temperature": "averageTemperature", "humidity": "averageHumidityPercent",
-    "operators": "operatorCount", "volume": "productionVolumeCubicMeters",
-    "shift": "shift", "machine_id": "machineID", "production_time": "ProductionTime",
-    "product_type": "productType", "production_id": "productionID",
-    "material_cost": "materialCostPerUnit", "labour_cost": "labourCostPerUnit",
-    "why": None,
+    "units":           "unitsProduced",
+    "defects":         "defects",
+    "downtime":        "downTimeHours",
+    "maintenance":     "maintenanceHours",
+    "scrap":           "scrapRate",
+    "rework":          "reworkHours",
+    "quality":         "qualityChecksFailed",
+    "energy":          "energyConsumption",
+    "temperature":     "averageTemperature",
+    "humidity":        "averageHumidityPercent",
+    "operators":       "operatorCount",
+    "volume":          "productionVolumeCubicMeters",
+    "shift":           "shift",
+    "machine_id":      "machineID",
+    "production_time": "ProductionTime",
+    "product_type":    "productType",
+    "production_id":   "productionID",
+    "material_cost":   "materialCostPerUnit",
+    "labour_cost":     "labourCostPerUnit",
+    "why":             None,
 }
 
 
@@ -497,8 +578,8 @@ def retrain_raw():
             return jsonify({"error": "No records provided"}), 400
 
         df = pd.DataFrame(records)
-        df['date']    = pd.to_datetime(df['date'], errors='coerce')
-        df[FEATURES]  = df[FEATURES].apply(pd.to_numeric, errors='coerce')
+        df['date']   = pd.to_datetime(df['date'], errors='coerce')
+        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
 
         label_counts = _train_core(df)
 
