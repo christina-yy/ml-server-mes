@@ -213,7 +213,7 @@ def _train_core(df):
     y = le.fit_transform(df['label'])
 
     cw = {
-        i: (3 if cls == "Critical" else 1)
+        i: (5 if cls == "Critical" else 1)
         for i, cls in enumerate(le.classes_)
     }
 
