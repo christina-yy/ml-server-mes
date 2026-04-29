@@ -7,4 +7,3 @@ pymysql
 sqlalchemy
 gunicorn
 shap
-imbalanced-learn
