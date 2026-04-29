@@ -81,7 +81,7 @@ def auto_label(row):
     if row['maintenanceHours'] > 4.5:   score += 2
     elif row['maintenanceHours'] > 4.0: score += 1
 
-    if score >= 5:   return "Critical"
+    if score >= 4:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
 
@@ -213,7 +213,7 @@ def _train_core(df):
     y = le.fit_transform(df['label'])
 
     cw = {
-        i: (3 if cls == "Critical" else 1)
+        i: (5 if cls == "Critical" else 1)
         for i, cls in enumerate(le.classes_)
     }
 
