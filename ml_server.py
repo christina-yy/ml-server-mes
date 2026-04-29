@@ -6,12 +6,10 @@ import pandas as pd
 import sqlalchemy
 import os
 import logging
-import concurrent.futures
 from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import StratifiedKFold, cross_val_score
 from imblearn.over_sampling import SMOTE
 
 app = Flask(__name__)
@@ -280,68 +278,13 @@ def _train_core(df):
         logging.info(f"Confusion matrix:\n{cm_header}\n{cm_rows}")
 
     # ─────────────────────────────────────────────
-    # Cross Validation (5-Fold) on SMOTE Data
-    # FIX: lighter CV model (100 trees), n_jobs=1, wrapped in
-    #      a 25-second timeout so a slow CV never kills the worker
+    # Cross Validation — DISABLED on Render
+    # CV is for offline evaluation only. Running 5-fold × 100 trees
+    # on a 3000+ row SMOTE dataset exceeds Render's 30s worker timeout.
+    # The test-set classification report above is sufficient for
+    # production monitoring. Re-enable locally if needed.
     # ─────────────────────────────────────────────
-    try:
-        cv_model = RandomForestClassifier(
-            n_estimators=100,   # ← FIX: was 500 — CV only needs a lighter model
-            n_jobs=1,           # ← FIX: single-threaded to avoid OOM
-            class_weight=cw,
-            min_samples_leaf=3,
-            max_features="sqrt",
-            random_state=42
-        )
-
-        kf = StratifiedKFold(n_splits=5, shuffle=False)
-
-        CV_TIMEOUT = 25  # seconds per metric — adjust if your dataset is large
-
-        def _run_cv(scoring):
-            return cross_val_score(
-                cv_model, X_train_sm, y_train_sm,
-                cv=kf, scoring=scoring
-            )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            # Accuracy
-            try:
-                cv_accuracy = executor.submit(_run_cv, 'accuracy').result(timeout=CV_TIMEOUT)
-            except concurrent.futures.TimeoutError:
-                logging.warning("CV accuracy timed out — skipping.")
-                cv_accuracy = None
-
-            # F1 Macro
-            try:
-                cv_f1 = executor.submit(_run_cv, 'f1_macro').result(timeout=CV_TIMEOUT)
-            except concurrent.futures.TimeoutError:
-                logging.warning("CV f1_macro timed out — skipping.")
-                cv_f1 = None
-
-            # Recall Macro
-            try:
-                cv_recall = executor.submit(_run_cv, 'recall_macro').result(timeout=CV_TIMEOUT)
-            except concurrent.futures.TimeoutError:
-                logging.warning("CV recall_macro timed out — skipping.")
-                cv_recall = None
-
-        # Build log message from whichever metrics completed
-        cv_lines = ["Cross Validation (5-fold):"]
-        if cv_accuracy is not None:
-            cv_lines.append(f"  Accuracy : {cv_accuracy.mean():.3f} ± {cv_accuracy.std():.3f}")
-            cv_lines.append(f"  Per-fold accuracy: {[round(s, 3) for s in cv_accuracy]}")
-        if cv_f1 is not None:
-            cv_lines.append(f"  F1 Macro : {cv_f1.mean():.3f} ± {cv_f1.std():.3f}")
-        if cv_recall is not None:
-            cv_lines.append(f"  Recall   : {cv_recall.mean():.3f} ± {cv_recall.std():.3f}")
-        if len(cv_lines) == 1:
-            cv_lines.append("  All CV metrics timed out — skipped.")
-
-        logging.info("\n".join(cv_lines))
-
-    except Exception as e:
-        logging.warning(f"Cross validation failed: {e}")
+    logging.info("Cross validation skipped (disabled for Render deployment).")
 
     logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
     return label_counts
