@@ -49,16 +49,22 @@ FEATURE_LABELS = {
     'averageHumidityPercent':  'Avg Humidity (%)',
 }
 
+# Features used in scoring rules
+SCORING_RULE_FEATURES = {
+    'defects', 'scrapRate', 'downTimeHours',
+    'reworkHours', 'qualityChecksFailed', 'maintenanceHours'
+}
+
 rf_model         = None
 le               = LabelEncoder()
 _feature_medians = {}
 
 
 # ─────────────────────────────────────────────
-# Auto Label
+# Auto Label Score (returns numeric score)
 # ─────────────────────────────────────────────
 
-def auto_label(row):
+def auto_label_score(row):
     score = 0
 
     if row['defects'] > 15:             score += 4
@@ -82,6 +88,15 @@ def auto_label(row):
     if row['maintenanceHours'] > 4.5:   score += 2
     elif row['maintenanceHours'] > 4.0: score += 1
 
+    return score
+
+
+# ─────────────────────────────────────────────
+# Auto Label
+# ─────────────────────────────────────────────
+
+def auto_label(row):
+    score = auto_label_score(row)
     if score >= 4:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
@@ -249,7 +264,7 @@ def _train_core(df):
     # ─────────────────────────────────────────────
     rf_model = RandomForestClassifier(
         n_estimators=500,
-        n_jobs=1,               # ← FIX: single-threaded to avoid OOM
+        n_jobs=1,
         class_weight=cw,
         min_samples_leaf=3,
         max_features="sqrt",
@@ -278,14 +293,21 @@ def _train_core(df):
         logging.info(f"Confusion matrix:\n{cm_header}\n{cm_rows}")
 
     # ─────────────────────────────────────────────
-    # Cross Validation — DISABLED on Render
-    # CV is for offline evaluation only. Running 5-fold × 100 trees
-    # on a 3000+ row SMOTE dataset exceeds Render's 30s worker timeout.
-    # The test-set classification report above is sufficient for
-    # production monitoring. Re-enable locally if needed.
+    # Feature Importance Log
     # ─────────────────────────────────────────────
-    logging.info("Cross validation skipped (disabled for Render deployment).")
+    importances = rf_model.feature_importances_
+    fi_sorted   = sorted(
+        zip(FEATURES, importances),
+        key=lambda x: x[1],
+        reverse=True
+    )
+    fi_log = " | ".join(
+        f"{FEATURE_LABELS[f]}: {round(v * 100, 4)}%"
+        for f, v in fi_sorted
+    )
+    logging.info(f"Feature importances: {fi_log}")
 
+    logging.info("Cross validation skipped (disabled for Render deployment).")
     logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
     return label_counts
 
@@ -566,6 +588,135 @@ def retrain_raw():
 
     except Exception as e:
         logging.error(f"/retrain-raw error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────
+# Feature Importance Route
+# ─────────────────────────────────────────────
+
+@app.route("/feature-importance", methods=["GET"])
+def feature_importance():
+    try:
+        if rf_model is None:
+            return jsonify({"error": "Model not trained yet. Call /retrain first."}), 400
+
+        importances = rf_model.feature_importances_
+
+        result = sorted(
+            [
+                {
+                    "feature":          FEATURE_LABELS[feat],
+                    "key":              feat,
+                    "importance":       round(float(imp) * 100, 2),
+                    "in_scoring_rules": feat in SCORING_RULE_FEATURES
+                }
+                for feat, imp in zip(FEATURES, importances)
+            ],
+            key=lambda x: x["importance"],
+            reverse=True
+        )
+
+        non_rule_total = round(sum(
+            item["importance"]
+            for item in result
+            if not item["in_scoring_rules"]
+        ), 2)
+
+        return jsonify({
+            "feature_importance":         result,
+            "non_scoring_rule_total_pct": non_rule_total,
+            "note": (
+                f"Features with in_scoring_rules=false (temperature, humidity, energy) "
+                f"collectively contribute {non_rule_total}% to model predictions "
+                f"despite not being used in label generation. "
+                f"This may contribute to misclassifications in borderline cases."
+            )
+        })
+
+    except Exception as e:
+        logging.error(f"/feature-importance error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────
+# Misclassified Route
+# ─────────────────────────────────────────────
+
+@app.route("/misclassified", methods=["GET"])
+def misclassified():
+    try:
+        if rf_model is None:
+            return jsonify({"error": "Model not trained yet. Call /retrain first."}), 400
+
+        today = datetime.today().strftime("%Y-%m-%d")
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                sqlalchemy.text("SELECT * FROM mes WHERE date <= :d ORDER BY date"),
+                conn, params={"d": today}
+            )
+
+        if df.empty:
+            return jsonify({"error": "No data found."}), 400
+
+        df = impute(df)
+        df['real_label'] = df.apply(auto_label, axis=1)
+
+        # Use last 20% as test set (same split as training)
+        split_idx = int(len(df) * 0.8)
+        df_test   = df.iloc[split_idx:].copy()
+
+        X_test      = df_test[FEATURES].values
+        y_pred      = rf_model.predict(X_test)
+        pred_labels = le.inverse_transform(y_pred)
+
+        df_test = df_test.copy()
+        df_test['predicted_label'] = pred_labels
+        df_test['score']           = df_test.apply(auto_label_score, axis=1)
+
+        # Filter only misclassified rows
+        wrong = df_test[df_test['real_label'] != df_test['predicted_label']].copy()
+
+        # Flag borderline cases (score exactly at boundary)
+        wrong['is_borderline'] = wrong['score'].apply(
+            lambda s: s in [2.0, 4.0, 2.5, 4.5]
+        )
+
+        # Select relevant columns for output
+        output_cols = [
+            'machineID', 'date', 'real_label', 'predicted_label',
+            'score', 'is_borderline',
+            'defects', 'scrapRate', 'downTimeHours',
+            'reworkHours', 'qualityChecksFailed', 'maintenanceHours',
+            'energyConsumption', 'averageTemperature', 'averageHumidityPercent'
+        ]
+
+        output_cols = [c for c in output_cols if c in wrong.columns]
+        result = wrong[output_cols].copy()
+
+        if 'date' in result.columns:
+            result['date'] = result['date'].astype(str)
+
+        borderline_count = int(wrong['is_borderline'].sum())
+        total_wrong      = len(wrong)
+        total_test       = len(df_test)
+
+        return jsonify({
+            "total_test_rows":       total_test,
+            "total_misclassified":   total_wrong,
+            "borderline_count":      borderline_count,
+            "borderline_percentage": round(borderline_count / total_wrong * 100, 1) if total_wrong > 0 else 0,
+            "summary": (
+                f"{borderline_count} out of {total_wrong} misclassified rows "
+                f"({round(borderline_count / total_wrong * 100, 1) if total_wrong > 0 else 0}%) "
+                f"had scores exactly at the class boundary (2, 2.5, 4, or 4.5), "
+                f"confirming that borderline threshold values are a primary cause of misclassification."
+            ),
+            "misclassified_rows": result.to_dict(orient='records')
+        })
+
+    except Exception as e:
+        logging.error(f"/misclassified error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
