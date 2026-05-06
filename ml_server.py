@@ -82,7 +82,7 @@ def auto_label(row):
     if row['maintenanceHours'] > 4.5:   score += 2
     elif row['maintenanceHours'] > 4.0: score += 1
 
-    if score >= 4:   return "Critical"
+    if score >= 5:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
 
