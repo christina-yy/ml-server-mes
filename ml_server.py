@@ -152,7 +152,7 @@ def auto_label(row):
 
     # FIX 6: Tightened Critical threshold (5 → 4) so a single
     # multi-metric bad shift isn't silently absorbed
-    if score >= 4:   return "Critical"
+    if score >= 5:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
 
