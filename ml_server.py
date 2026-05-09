@@ -511,8 +511,8 @@ def predict():
         recent_rows = df.head(3)
         critical_count = sum(1 for _, r in recent_rows.iterrows() if auto_label(r) == "Critical")
         if critical_count >= 2:
-        label = "Critical"
-        logging.info(f"Machine {machine_id}: escalated to Critical — {critical_count}/3 recent rows are Critical")
+            label = "Critical"
+            logging.info(f"Machine {machine_id}: escalated to Critical — {critical_count}/3 recent rows are Critical")
         
         class_probs = {
             cls: round(float(p) * 100, 1)
@@ -593,8 +593,8 @@ def predict_raw():
         recent_rows = df.head(3)
         critical_count = sum(1 for _, r in recent_rows.iterrows() if auto_label(r) == "Critical")
         if critical_count >= 2:
-        label = "Critical"
-        logging.info(f"Escalated to Critical — {critical_count}/3 recent rows are Critical")
+            label = "Critical"
+            logging.info(f"Escalated to Critical — {critical_count}/3 recent rows are Critical")
 
         class_probs = {
             cls: round(float(p) * 100, 1)
