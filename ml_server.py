@@ -564,11 +564,12 @@ def predict_raw():
             return jsonify({"error": "No records provided"}), 400
 
         df = pd.DataFrame(records)
-        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
-        df = add_defect_rate(df)
+        BASE_FEATURES = [f for f in FEATURES if f != 'defectRate']
+        existing_cols = [f for f in BASE_FEATURES if f in df.columns]
+        df[existing_cols] = df[existing_cols].apply(pd.to_numeric, errors='coerce')
+        df = add_defect_rate(df) 
         df = impute(df)
 
-        # FIX 1: Weighted aggregate + escalation
         row          = weighted_aggregate(df)
         latest_label = auto_label(df.iloc[0])
 
@@ -620,8 +621,13 @@ def retrain_raw():
             return jsonify({"error": "No records provided"}), 400
 
         df = pd.DataFrame(records)
-        df['date']    = pd.to_datetime(df['date'], errors='coerce')
-        df[FEATURES]  = df[FEATURES].apply(pd.to_numeric, errors='coerce')
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+        # ✅ Only coerce the base features — exclude 'defectRate' since
+        #    _train_core() will call add_defect_rate() to create it
+        BASE_FEATURES = [f for f in FEATURES if f != 'defectRate']
+        existing_cols = [f for f in BASE_FEATURES if f in df.columns]
+        df[existing_cols] = df[existing_cols].apply(pd.to_numeric, errors='coerce')
 
         label_counts = _train_core(df)
 
