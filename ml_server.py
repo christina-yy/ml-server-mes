@@ -477,7 +477,7 @@ def predict():
                 sqlalchemy.text("""
                     SELECT * FROM mes
                     WHERE machineID = :mid AND date <= :d
-                    ORDER BY date DESC LIMIT 14
+                    ORDER BY date DESC LIMIT 7
                 """),
                 conn, params={"mid": machine_id, "d": today}
             )
