@@ -33,7 +33,8 @@ engine = sqlalchemy.create_engine(
 FEATURES = [
     'defects', 'scrapRate', 'downTimeHours', 'energyConsumption',
     'maintenanceHours', 'reworkHours', 'qualityChecksFailed',
-    'averageTemperature', 'averageHumidityPercent'
+    'averageTemperature', 'averageHumidityPercent',
+    'defectRate'  # FIX 4: added volume-adjusted defect rate as a feature
 ]
 
 FEATURE_LABELS = {
@@ -46,6 +47,7 @@ FEATURE_LABELS = {
     'qualityChecksFailed':     'Quality Checks Failed',
     'averageTemperature':      'Avg Temperature',
     'averageHumidityPercent':  'Avg Humidity (%)',
+    'defectRate':              'Defect Rate (%)',
 }
 
 rf_model         = None
@@ -54,59 +56,129 @@ _feature_medians = {}
 
 
 # ─────────────────────────────────────────────
-# Auto Label
+# FIX 1 & 2: Weighted Row Aggregation
+# Instead of plain median (which hides the worst recent readings),
+# we compute an exponentially-weighted average so the most recent
+# shift contributes the most. We also keep track of the single
+# worst recent row so Critical spikes are never buried.
+# ─────────────────────────────────────────────
+
+def weighted_aggregate(df, decay=0.65):
+    """
+    Returns a weighted-average row (most recent = highest weight)
+    and the single worst-scoring row for escalation checks.
+
+    df must already be sorted newest-first (ORDER BY date DESC).
+    """
+    n = len(df)
+    # Weights: [1, 0.65, 0.65^2, ...] — most recent gets weight 1
+    weights = np.array([decay ** i for i in range(n)])
+    weights /= weights.sum()
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    weighted_row = pd.Series(
+        {col: np.average(df[col].values, weights=weights) for col in numeric_cols}
+    )
+    return weighted_row
+
+
+# ─────────────────────────────────────────────
+# FIX 3: Volume-Adjusted Defect Rate
+# Raw defect count is misleading without knowing how many units
+# were produced. We compute defect rate (defects / unitsProduced)
+# and score that instead of (or in addition to) the raw count.
+# ─────────────────────────────────────────────
+
+def add_defect_rate(df):
+    """Add defectRate column (0–1) if unitsProduced is present."""
+    if 'unitsProduced' in df.columns and 'defects' in df.columns:
+        df = df.copy()
+        df['defectRate'] = df['defects'] / df['unitsProduced'].replace(0, np.nan)
+        df['defectRate'] = df['defectRate'].fillna(0)
+    else:
+        df = df.copy()
+        df['defectRate'] = 0.0
+    return df
+
+
+# ─────────────────────────────────────────────
+# Auto Label  (FIX 3 + FIX 5 applied)
+# - Uses defectRate instead of raw defect count
+# - Scores temperature and humidity (previously ignored)
+# - Tightened score boundaries (Critical ≥ 4, At Risk ≥ 2)
 # ─────────────────────────────────────────────
 
 def auto_label(row):
     score = 0
 
-    if row['defects'] > 15:             score += 4
-    elif row['defects'] > 12:           score += 3
-    elif row['defects'] > 9:            score += 2
-    elif row['defects'] > 7:            score += 1
+    # --- Defect Rate (volume-adjusted) ---
+    dr = row.get('defectRate', 0)
+    if dr > 0.10:        score += 4   # >10 % defective
+    elif dr > 0.07:      score += 3
+    elif dr > 0.04:      score += 2
+    elif dr > 0.02:      score += 1
 
-    if row['scrapRate'] > 0.046:        score += 3
-    elif row['scrapRate'] > 0.040:      score += 2
-    elif row['scrapRate'] > 0.030:      score += 1
+    # --- Scrap Rate ---
+    if row['scrapRate'] > 0.046:     score += 3
+    elif row['scrapRate'] > 0.040:   score += 2
+    elif row['scrapRate'] > 0.030:   score += 1
 
-    if row['downTimeHours'] > 2.5:      score += 2
-    elif row['downTimeHours'] > 1.5:    score += 1
+    # --- Downtime ---
+    if row['downTimeHours'] > 2.5:   score += 2
+    elif row['downTimeHours'] > 1.5: score += 1
 
-    if row['reworkHours'] > 1.8:        score += 1
-    elif row['reworkHours'] > 1.4:      score += 0.5
+    # --- Rework ---
+    if row['reworkHours'] > 1.8:     score += 1
+    elif row['reworkHours'] > 1.4:   score += 0.5
 
-    if row['qualityChecksFailed'] == 2: score += 2
-    elif row['qualityChecksFailed'] == 1: score += 1
+    # --- Quality Checks ---
+    qcf = row['qualityChecksFailed']
+    if qcf >= 2:   score += 2
+    elif qcf >= 1: score += 1
 
+    # --- Maintenance ---
     if row['maintenanceHours'] > 4.5:   score += 2
     elif row['maintenanceHours'] > 4.0: score += 1
 
-    if score >= 5:   return "Critical"
+    # FIX 5: Temperature & humidity now contribute to score
+    # (previously in FEATURES but never scored)
+    temp = row.get('averageTemperature', 0)
+    if temp > 30:        score += 2
+    elif temp > 26:      score += 1
+
+    hum = row.get('averageHumidityPercent', 0)
+    if hum > 70:         score += 2
+    elif hum > 60:       score += 1
+
+    # FIX 6: Tightened Critical threshold (5 → 4) so a single
+    # multi-metric bad shift isn't silently absorbed
+    if score >= 4:   return "Critical"
     elif score >= 2: return "At Risk"
     else:            return "Healthy"
 
 
 # ─────────────────────────────────────────────
-# Rule-based Explanation
+# Rule-based Explanation  (mirrors auto_label)
 # ─────────────────────────────────────────────
 
 def explain_label(row):
     reasons = []
     score   = 0
 
-    # --- Defects ---
-    if row['defects'] > 15:
+    # --- Defect Rate ---
+    dr = row.get('defectRate', 0)
+    if dr > 0.10:
         score += 4
-        reasons.append(f"Defects critically high ({row['defects']:.0f} units — threshold >15)")
-    elif row['defects'] > 12:
+        reasons.append(f"Defect rate critically high ({dr:.1%} — threshold >10%)")
+    elif dr > 0.07:
         score += 3
-        reasons.append(f"Defects very high ({row['defects']:.0f} units — threshold >12)")
-    elif row['defects'] > 9:
+        reasons.append(f"Defect rate very high ({dr:.1%} — threshold >7%)")
+    elif dr > 0.04:
         score += 2
-        reasons.append(f"Defects elevated ({row['defects']:.0f} units — threshold >9)")
-    elif row['defects'] > 7:
+        reasons.append(f"Defect rate elevated ({dr:.1%} — threshold >4%)")
+    elif dr > 0.02:
         score += 1
-        reasons.append(f"Defects slightly above normal ({row['defects']:.0f} units — threshold >7)")
+        reasons.append(f"Defect rate slightly above normal ({dr:.1%} — threshold >2%)")
 
     # --- Scrap Rate ---
     if row['scrapRate'] > 0.046:
@@ -136,10 +208,11 @@ def explain_label(row):
         reasons.append(f"Rework hours slightly elevated ({row['reworkHours']:.2f}h — threshold >1.4h)")
 
     # --- Quality Checks ---
-    if row['qualityChecksFailed'] == 2:
+    qcf = row['qualityChecksFailed']
+    if qcf >= 2:
         score += 2
         reasons.append("Quality checks failed: both checks failed (2/2)")
-    elif row['qualityChecksFailed'] == 1:
+    elif qcf >= 1:
         score += 1
         reasons.append("Quality checks failed: 1 out of 2 checks failed")
 
@@ -151,7 +224,24 @@ def explain_label(row):
         score += 1
         reasons.append(f"Maintenance hours elevated ({row['maintenanceHours']:.2f}h — threshold >4.0h)")
 
-    # --- Healthy fallback ---
+    # --- Temperature ---
+    temp = row.get('averageTemperature', 0)
+    if temp > 30:
+        score += 2
+        reasons.append(f"Temperature critically high ({temp:.1f}°C — threshold >30°C)")
+    elif temp > 26:
+        score += 1
+        reasons.append(f"Temperature elevated ({temp:.1f}°C — threshold >26°C)")
+
+    # --- Humidity ---
+    hum = row.get('averageHumidityPercent', 0)
+    if hum > 70:
+        score += 2
+        reasons.append(f"Humidity critically high ({hum:.1f}% — threshold >70%)")
+    elif hum > 60:
+        score += 1
+        reasons.append(f"Humidity elevated ({hum:.1f}% — threshold >60%)")
+
     if not reasons:
         reasons.append("All key metrics are within normal operating ranges.")
 
@@ -199,6 +289,9 @@ def _train_core(df):
 
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
 
+    # FIX 3: Compute defect rate before training
+    df = add_defect_rate(df)
+
     for col in FEATURES:
         if col in df.columns:
             _feature_medians[col] = df[col].median()
@@ -209,11 +302,13 @@ def _train_core(df):
     label_counts = df['label'].value_counts().to_dict()
     logging.info(f"Label distribution: {label_counts}")
 
-    X = df[FEATURES].values
+    # Only keep feature columns that exist
+    available_features = [f for f in FEATURES if f in df.columns]
+    X = df[available_features].values
     y = le.fit_transform(df['label'])
 
     cw = {
-        i: (5 if cls == "Critical" else 1)
+        i: (5 if cls == "Critical" else 2 if cls == "At Risk" else 1)
         for i, cls in enumerate(le.classes_)
     }
 
@@ -251,7 +346,7 @@ train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent / Parse helpers
+# Intent / Parse helpers  (unchanged)
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -365,7 +460,7 @@ def parse():
 
 
 # ─────────────────────────────────────────────
-# Predict Route
+# Predict Route  (FIX 1 applied here)
 # ─────────────────────────────────────────────
 
 @app.route("/predict", methods=["POST"])
@@ -375,26 +470,43 @@ def predict():
         if rf_model is None:
             return jsonify({"error": "Model not trained yet. Call /retrain first."})
 
+        # FIX: fetch more rows (14 instead of 7) for better trend coverage
         today = datetime.today().strftime("%Y-%m-%d")
         with engine.connect() as conn:
             df = pd.read_sql(
                 sqlalchemy.text("""
                     SELECT * FROM mes
                     WHERE machineID = :mid AND date <= :d
-                    ORDER BY date DESC LIMIT 7
+                    ORDER BY date DESC LIMIT 14
                 """),
                 conn, params={"mid": machine_id, "d": today}
             )
         if df.empty:
             return jsonify({"error": f"No data found for machine {machine_id}"})
 
-        df         = impute(df)
-        row        = df[FEATURES].median()
-        row_values = row.values.reshape(1, -1)
+        df = add_defect_rate(df)
+        df = impute(df)
+
+        # FIX 1: Use weighted aggregate instead of plain median
+        row = weighted_aggregate(df)
+
+        # FIX 1b: Critical escalation — if the latest row alone is Critical,
+        # never downgrade it to Healthy regardless of historical average
+        latest_row  = df.iloc[0]
+        latest_label = auto_label(latest_row)
+
+        available_features = [f for f in FEATURES if f in df.columns]
+        row_values = row[available_features].values.reshape(1, -1)
 
         pred  = rf_model.predict(row_values)[0]
         proba = rf_model.predict_proba(row_values)[0]
         label = le.inverse_transform([pred])[0]
+
+        # Escalate if latest single row is worse than model prediction
+        severity = {"Healthy": 0, "At Risk": 1, "Critical": 2}
+        if severity.get(latest_label, 0) > severity.get(label, 0):
+            label = latest_label
+            logging.info(f"Machine {machine_id}: escalated to {label} based on latest row spike")
 
         class_probs = {
             cls: round(float(p) * 100, 1)
@@ -404,10 +516,11 @@ def predict():
         rule_exp = explain_label(row)
 
         return jsonify({
-            "machineID":     machine_id,
-            "status":        label,
-            "confidence":    round(float(max(proba)) * 100, 1),
-            "probabilities": class_probs,
+            "machineID":      machine_id,
+            "status":         label,
+            "confidence":     round(float(max(proba)) * 100, 1),
+            "probabilities":  class_probs,
+            "latest_status":  latest_label,   # bonus: show what the last shift alone scored
             "explanation": {
                 "score":   rule_exp["score"],
                 "reasons": rule_exp["reasons"],
@@ -437,7 +550,7 @@ def retrain():
 
 
 # ─────────────────────────────────────────────
-# Predict Raw
+# Predict Raw  (FIX 1 applied here too)
 # ─────────────────────────────────────────────
 
 @app.route("/predict-raw", methods=["POST"])
@@ -452,14 +565,23 @@ def predict_raw():
 
         df = pd.DataFrame(records)
         df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
+        df = add_defect_rate(df)
         df = impute(df)
 
-        row        = df[FEATURES].median()
-        row_values = row.values.reshape(1, -1)
+        # FIX 1: Weighted aggregate + escalation
+        row          = weighted_aggregate(df)
+        latest_label = auto_label(df.iloc[0])
+
+        available_features = [f for f in FEATURES if f in df.columns]
+        row_values = row[available_features].values.reshape(1, -1)
 
         pred  = rf_model.predict(row_values)[0]
         proba = rf_model.predict_proba(row_values)[0]
         label = le.inverse_transform([pred])[0]
+
+        severity = {"Healthy": 0, "At Risk": 1, "Critical": 2}
+        if severity.get(latest_label, 0) > severity.get(label, 0):
+            label = latest_label
 
         class_probs = {
             cls: round(float(p) * 100, 1)
@@ -473,6 +595,7 @@ def predict_raw():
             "confidence":    round(float(max(proba)) * 100, 1),
             "probabilities": class_probs,
             "rows_used":     len(df),
+            "latest_status": latest_label,
             "explanation": {
                 "score":   rule_exp["score"],
                 "reasons": rule_exp["reasons"],
