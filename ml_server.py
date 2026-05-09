@@ -10,7 +10,6 @@ from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
-from imblearn.over_sampling import SMOTE
 
 app = Flask(__name__)
 CORS(app)
@@ -213,60 +212,27 @@ def _train_core(df):
     X = df[FEATURES].values
     y = le.fit_transform(df['label'])
 
-    # ─────────────────────────────────────────────
-    # Time-aware Train/Test Split (80/20)
-    # ─────────────────────────────────────────────
-    split_idx       = int(len(df) * 0.8)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-
-    # ─────────────────────────────────────────────
-    # SMOTE — Oversample Minority Classes
-    # ─────────────────────────────────────────────
-    try:
-        sm = SMOTE(random_state=42, k_neighbors=5)
-        X_train_sm, y_train_sm = sm.fit_resample(X_train, y_train)
-        logging.info(
-            f"SMOTE applied — "
-            f"before: {len(X_train)} rows, "
-            f"after: {len(X_train_sm)} rows"
-        )
-    except Exception as e:
-        logging.warning(f"SMOTE failed ({e}), using original training data.")
-        X_train_sm, y_train_sm = X_train, y_train
-
-    # ─────────────────────────────────────────────
-    # Class Weights
-    # ─────────────────────────────────────────────
     cw = {
         i: (5 if cls == "Critical" else 1)
         for i, cls in enumerate(le.classes_)
     }
 
-    # ─────────────────────────────────────────────
-    # Train Random Forest
-    # FIX: added n_jobs=1 to prevent thread explosion on Render
-    # ─────────────────────────────────────────────
+    split_idx       = int(len(df) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
     rf_model = RandomForestClassifier(
         n_estimators=500,
-        n_jobs=1,               # ← FIX: single-threaded to avoid OOM
         class_weight=cw,
         min_samples_leaf=3,
         max_features="sqrt",
         random_state=42
     )
-    rf_model.fit(X_train_sm, y_train_sm)
+    rf_model.fit(X_train, y_train)
 
-    # ─────────────────────────────────────────────
-    # Test Set Evaluation
-    # ─────────────────────────────────────────────
     if len(X_test) > 0:
         y_pred = rf_model.predict(X_test)
-        report = classification_report(
-            y_test, y_pred,
-            target_names=le.classes_,
-            zero_division=0
-        )
+        report = classification_report(y_test, y_pred, target_names=le.classes_, zero_division=0)
         logging.info(f"Classification report:\n{report}")
 
         cm        = confusion_matrix(y_test, y_pred)
@@ -277,15 +243,6 @@ def _train_core(df):
         )
         logging.info(f"Confusion matrix:\n{cm_header}\n{cm_rows}")
 
-    # ─────────────────────────────────────────────
-    # Cross Validation — DISABLED on Render
-    # CV is for offline evaluation only. Running 5-fold × 100 trees
-    # on a 3000+ row SMOTE dataset exceeds Render's 30s worker timeout.
-    # The test-set classification report above is sufficient for
-    # production monitoring. Re-enable locally if needed.
-    # ─────────────────────────────────────────────
-    logging.info("Cross validation skipped (disabled for Render deployment).")
-
     logging.info(f"Model trained on {len(df)} rows. Classes: {list(le.classes_)}")
     return label_counts
 
@@ -294,7 +251,7 @@ train_model()
 
 
 # ─────────────────────────────────────────────
-# Intent / Parse Helpers
+# Intent / Parse helpers
 # ─────────────────────────────────────────────
 
 INTENT_KEYWORDS = {
@@ -326,26 +283,15 @@ INTENT_KEYWORDS = {
 }
 
 INTENT_FIELD_MAP = {
-    "units":           "unitsProduced",
-    "defects":         "defects",
-    "downtime":        "downTimeHours",
-    "maintenance":     "maintenanceHours",
-    "scrap":           "scrapRate",
-    "rework":          "reworkHours",
-    "quality":         "qualityChecksFailed",
-    "energy":          "energyConsumption",
-    "temperature":     "averageTemperature",
-    "humidity":        "averageHumidityPercent",
-    "operators":       "operatorCount",
-    "volume":          "productionVolumeCubicMeters",
-    "shift":           "shift",
-    "machine_id":      "machineID",
-    "production_time": "ProductionTime",
-    "product_type":    "productType",
-    "production_id":   "productionID",
-    "material_cost":   "materialCostPerUnit",
-    "labour_cost":     "labourCostPerUnit",
-    "why":             None,
+    "units": "unitsProduced", "defects": "defects", "downtime": "downTimeHours",
+    "maintenance": "maintenanceHours", "scrap": "scrapRate", "rework": "reworkHours",
+    "quality": "qualityChecksFailed", "energy": "energyConsumption",
+    "temperature": "averageTemperature", "humidity": "averageHumidityPercent",
+    "operators": "operatorCount", "volume": "productionVolumeCubicMeters",
+    "shift": "shift", "machine_id": "machineID", "production_time": "ProductionTime",
+    "product_type": "productType", "production_id": "productionID",
+    "material_cost": "materialCostPerUnit", "labour_cost": "labourCostPerUnit",
+    "why": None,
 }
 
 
@@ -551,8 +497,8 @@ def retrain_raw():
             return jsonify({"error": "No records provided"}), 400
 
         df = pd.DataFrame(records)
-        df['date']   = pd.to_datetime(df['date'], errors='coerce')
-        df[FEATURES] = df[FEATURES].apply(pd.to_numeric, errors='coerce')
+        df['date']    = pd.to_datetime(df['date'], errors='coerce')
+        df[FEATURES]  = df[FEATURES].apply(pd.to_numeric, errors='coerce')
 
         label_counts = _train_core(df)
 
