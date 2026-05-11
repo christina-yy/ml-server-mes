@@ -155,19 +155,19 @@ def explain_label(row):
     score   = 0
 
     # --- Defect Rate ---
-    dr = row.get('defectRate', 0)
+    dr = row.get('defectRate', 0) or 0
     if dr > 0.10:
         score += 4
-        reasons.append(f"Defect rate critically high ({dr:.1%} — threshold >10%)")
-    elif dr > 0.07:
+        reasons.append(f"Defect rate critically high ({dr:.2%} — threshold >10%)")
+    elif dr > 0.08:
         score += 3
-        reasons.append(f"Defect rate very high ({dr:.1%} — threshold >7%)")
-    elif dr > 0.04:
+        reasons.append(f"Defect rate very high ({dr:.2%} — threshold >8%)")
+    elif dr > 0.05:
         score += 2
-        reasons.append(f"Defect rate elevated ({dr:.1%} — threshold >4%)")
-    elif dr > 0.02:
+        reasons.append(f"Defect rate elevated ({dr:.2%} — threshold >5%)")
+    elif dr > 0.03:
         score += 1
-        reasons.append(f"Defect rate slightly above normal ({dr:.1%} — threshold >2%)")
+        reasons.append(f"Defect rate above median ({dr:.2%} — threshold >3%)")
 
     # --- Scrap Rate ---
     if row['scrapRate'] > 0.046:
