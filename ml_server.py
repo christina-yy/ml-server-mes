@@ -110,10 +110,10 @@ def auto_label(row):
 
     # --- Defect Rate (volume-adjusted) ---
     dr = row.get('defectRate', 0)
-    if dr > 0.10:        score += 4   # >10% defective
-    elif dr > 0.07:      score += 3
-    elif dr > 0.04:      score += 2
-    elif dr > 0.02:      score += 1
+    if dr > 0.10:        score += 4  
+    elif dr > 0.08:      score += 3
+    elif dr > 0.05:      score += 2
+    elif dr > 0.03:      score += 1
 
     # --- Scrap Rate ---
     if row['scrapRate'] > 0.046:     score += 3
