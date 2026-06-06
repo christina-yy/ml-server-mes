@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
 import re
 import numpy as np
 import pandas as pd
@@ -635,8 +636,6 @@ def retrain_raw():
 # Send Email Route (Proxy for AwardSpace)
 # ─────────────────────────────────────────────
 
-import requests
-
 @app.route("/send-email", methods=["POST"])
 def send_email():
     try:
@@ -686,7 +685,7 @@ def send_email():
             json=payload,
             headers={
                 "Content-Type": "application/json",
-                "api-key": "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"
+                "api-key": os.environ.get("BREVO_API_KEY", "")
             },
             timeout=10
         )
