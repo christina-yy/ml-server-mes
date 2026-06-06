@@ -651,7 +651,7 @@ def send_email():
         payload = {
             "sender": {
                 "name":  "MES System",
-                "email": "messystemapp@gmail.com"
+                "email": "mesystemapp@gmail.com"
             },
             "to": [{"email": to_email, "name": to_name}],
             "subject": "Your Account Has Been Created",
