@@ -631,6 +631,76 @@ def retrain_raw():
         logging.error(f"/retrain-raw error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# ─────────────────────────────────────────────
+# Send Email Route (Proxy for AwardSpace)
+# ─────────────────────────────────────────────
+
+import requests
+
+@app.route("/send-email", methods=["POST"])
+def send_email():
+    try:
+        data      = request.json
+        to_email  = data.get("toEmail")
+        to_name   = data.get("toName")
+        password  = data.get("password")
+        login_url = data.get("loginUrl", "http://messystem.mypressonline.com/index.php")
+
+        if not to_email or not to_name or not password:
+            return jsonify({"success": False, "error": "Missing required fields"}), 400
+
+        payload = {
+            "sender": {
+                "name":  "MES System",
+                "email": "mesystemapp@gmail.com"
+            },
+            "to": [{"email": to_email, "name": to_name}],
+            "subject": "Your Account Has Been Created",
+            "htmlContent": f"""
+            <div style='font-family:Arial,sans-serif;max-width:500px;margin:auto;
+                        padding:24px;border:1px solid #e0e0e0;border-radius:8px;'>
+                <h2 style='color:#1a1a1a;margin-top:0;'>Welcome, {to_name}!</h2>
+                <p style='color:#444;'>An account has been created for you. Here are your login details:</p>
+                <table style='width:100%;border-collapse:collapse;margin:16px 0;'>
+                    <tr>
+                        <td style='padding:8px 12px;background:#f5f5f5;
+                                   font-weight:bold;border:1px solid #ddd;width:40%;'>Username</td>
+                        <td style='padding:8px 12px;border:1px solid #ddd;'>{to_name}</td>
+                    </tr>
+                    <tr>
+                        <td style='padding:8px 12px;background:#f5f5f5;
+                                   font-weight:bold;border:1px solid #ddd;'>Password</td>
+                        <td style='padding:8px 12px;border:1px solid #ddd;
+                                   font-family:monospace;'>{password}</td>
+                    </tr>
+                </table>
+                <a href='{login_url}'
+                   style='display:inline-block;margin-top:8px;padding:10px 20px;
+                          background:#1a1a1a;color:#fff;text-decoration:none;
+                          border-radius:5px;font-size:14px;'>Login Now</a>
+            </div>"""
+        }
+
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "api-key": "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"
+            },
+            timeout=10
+        )
+
+        if response.status_code == 201:
+            logging.info(f"Email sent to {to_email}")
+            return jsonify({"success": True, "message": "Email sent"})
+        else:
+            logging.error(f"Brevo error: {response.text}")
+            return jsonify({"success": False, "error": response.text}), 400
+
+    except Exception as e:
+        logging.error(f"/send-email error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 # ─────────────────────────────────────────────
 # Entry Point
